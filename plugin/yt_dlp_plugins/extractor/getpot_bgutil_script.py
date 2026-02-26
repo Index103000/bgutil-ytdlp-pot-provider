@@ -227,17 +227,61 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         self.logger.trace(
             f'Generating POT via script: {self._script_path}')
 
+        # 初始化命令行
         command_args = [self._jsrt_path, *self._jsrt_args(), self._script_path]
-        if proxy := request.request_proxy:
-            command_args.extend(['-p', proxy])
-        command_args.extend(['-c', get_webpo_content_binding(request)[0]])
-        if request.bypass_cache:
-            command_args.append('--bypass-cache')
-        if request.request_source_address:
-            command_args.extend(
-                ['--source-address', request.request_source_address])
-        if request.request_verify_tls is False:
-            command_args.append('--disable-tls-verification')
+
+        # 注意：这里注释掉原先项目中关于参数的使用方式，改为 stdin 方案，这样可以与 http 方案一致，且可以传递 大内容的 payload，从而防止触发命令行长度限制
+        # if proxy := request.request_proxy:
+        #     command_args.extend(['-p', proxy])
+        # command_args.extend(['-c', get_webpo_content_binding(request)[0]])
+        # if request.bypass_cache:
+        #     command_args.append('--bypass-cache')
+        # if request.request_source_address:
+        #     command_args.extend(
+        #         ['--source-address', request.request_source_address])
+        # if request.request_verify_tls is False:
+        #     command_args.append('--disable-tls-verification')
+
+        # 打印 pot 生成的详细日志（用于打印 SessionManager 中的过程日志，推荐仅在debug时使用）
+        command_args.append('--verbose')
+
+        # 同步 http 方案 对应参数，确保与 http 方案 参数一致
+        disable_innertube = bool(self._base_config_arg('disable_innertube'))
+        challenge = self._get_attestation(None if disable_innertube else request.video_webpage)
+        # The challenge is falsy when the webpage and the challenge are unavailable
+        # In this case, we need to disable /att/get since it's broken for web_music
+        if not challenge and request.internal_client_name == 'web_music':
+            if not disable_innertube:  # if not already set, warn the user
+                self.logger.warning(
+                    'BotGuard challenges could not be obtained from the webpage, '
+                    'overriding disable_innertube=True because InnerTube challenges '
+                    'are currently broken for the web_music client. '
+                    'Pass disable_innertube=1 to suppress this warning.')
+            disable_innertube = True
+
+        # 构建“stdin payload”：把所有可能用到的参数统一放进去
+        # - 这样脚本端逻辑更像 HTTP body
+        # - 也避免 argv 在不同 OS 上的 quoting / escaping 坑
+        payload = {
+            # 与 HTTP server 一致的字段命名，便于脚本端复用解析逻辑
+            'bypass_cache': request.bypass_cache,
+            'challenge': challenge,  # 这里是对象/字符串/None，直接塞进去，json.dumps 会处理
+            'content_binding': get_webpo_content_binding(request)[0],
+            'disable_innertube': disable_innertube,
+            'disable_tls_verification': not request.request_verify_tls,
+            'proxy': request.request_proxy,
+            'innertube_context': request.innertube_context,
+            'source_address': request.request_source_address,
+        }
+        # 序列化 payload
+        # - ensure_ascii=False：保留非 ASCII（虽然这里主要是英文，但保持一致）
+        # - separators：去掉空格，减小体积（虽然 stdin 不怕长，但更省）
+        payload_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        # 打印 payload
+        self.logger.trace(f'stdin payload={payload_str}')
+        # 加一个短开关，告诉脚本“从 stdin 读取 JSON payload”
+        # 这个参数非常短，不会触发命令行长度限制
+        command_args.append('--stdin-json')
 
         self.logger.info(
             f'Generating a {request.context.value} PO Token for '
@@ -247,9 +291,23 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             f'Executing command to get POT via script: {" ".join(command_args)}')
 
         try:
-            stdout, _, returncode = Popen.run(
-                command_args, stdout=subprocess.PIPE, text=True,
-                timeout=self._GETPOT_TIMEOUT)
+            # stdout, _, returncode = Popen.run(
+            #     command_args, stdout=subprocess.PIPE, text=True,
+            #     timeout=self._GETPOT_TIMEOUT)
+
+            # 不能用 Popen.run(input=...)：因为 yt-dlp 的 Popen.run 不会把 input 传给 communicate()，而我们需要 input 传递大内容 payload
+            # 所以这里手动创建进程，然后 communicate(input=...) 写入 stdin
+            with Popen(
+                    command_args,
+                    text=True,  # 让 stdin/stdout 走 str（内部会设置 encoding=utf-8, errors=replace）
+                    stdin=subprocess.PIPE,  # 必须：让我们可以写入 stdin
+                    stdout=subprocess.PIPE,  # 捕获 stdout
+                    stderr=subprocess.STDOUT,  # stderr 合并到 stdout，保持你原来的“最后一行 JSON”约定
+            ) as proc:
+                # 关键：communicate_or_kill 支持把 input 写入 stdin（内部调用 subprocess.Popen.communicate）
+                stdout, _ = proc.communicate_or_kill(input=payload_str, timeout=self._GETPOT_TIMEOUT)
+                returncode = proc.returncode
+
             stdout_lines = stdout.strip().splitlines()
             json_resp = stdout_lines.pop()
         except subprocess.TimeoutExpired as e:
@@ -260,7 +318,11 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
                 f'_get_pot_via_script failed: Unable to run script (caused by {e!r})') from e
 
         if stdout_extra := stdout_lines:
-            self.logger.trace(f'script stdout:\n{stdout_extra}')
+            # self.logger.trace(f'script stdout:\n{stdout_extra}')
+            # stdout_extra 是 list，直接 f-string 会变成 ['line1', 'line2'] 这种一行，不直观
+            # 改成更明确可见的输出（逐行输出）：
+            for line in stdout_extra:
+                self.logger.trace(f'script stdout: {line}')
         if returncode:
             raise PoTokenProviderError(
                 f'_get_pot_via_script failed with returncode {returncode}')

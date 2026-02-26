@@ -35,7 +35,7 @@ class BgUtilPTPBase(PoTokenProvider, abc.ABC):
         PoTokenContext.PLAYER,
         PoTokenContext.SUBS,
     )
-    _GETPOT_TIMEOUT = 20.0
+    _GETPOT_TIMEOUT = 120.0
 
     def _info_and_raise(self, msg, raise_from=None):
         self.logger.info(msg)

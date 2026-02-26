@@ -32,7 +32,8 @@ class BgUtilHTTPPTP(BgUtilPTPBase):
 
     @functools.cached_property
     def _base_url(self):
-        base_url = self._configuration_arg('base_url', default=[None])[0]
+        base_url = self.ie._configuration_arg(
+            ie_key='youtubepot-bgutilscript', key='base_url', default=[None])[0]
 
         if base_url:
             return base_url
@@ -122,19 +123,23 @@ class BgUtilHTTPPTP(BgUtilPTPBase):
                     'Pass disable_innertube=1 to suppress this warning.')
             disable_innertube = True
 
+        payload = {
+            'bypass_cache': request.bypass_cache,
+            'challenge': challenge,
+            'content_binding': get_webpo_content_binding(request)[0],
+            'disable_innertube': disable_innertube,
+            'disable_tls_verification': not request.request_verify_tls,
+            'proxy': request.request_proxy,
+            'innertube_context': request.innertube_context,
+            'source_address': request.request_source_address,
+        }
+        # 打印 payload
+        self.logger.trace(f'stdin payload={payload}')
+
         try:
             response = self._request_webpage(
                 request=Request(
-                    f'{self._base_url}/get_pot', data=json.dumps({
-                        'bypass_cache': request.bypass_cache,
-                        'challenge': challenge,
-                        'content_binding': get_webpo_content_binding(request)[0],
-                        'disable_innertube': disable_innertube,
-                        'disable_tls_verification': not request.request_verify_tls,
-                        'proxy': request.request_proxy,
-                        'innertube_context': request.innertube_context,
-                        'source_address': request.request_source_address,
-                    }).encode(), headers={'Content-Type': 'application/json'},
+                    f'{self._base_url}/get_pot', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'},
                     extensions={'timeout': self._GETPOT_TIMEOUT}, proxies={'all': None}),
                 note=f'Generating a {request.context.value} PO Token for '
                 f'{request.internal_client_name} client via bgutil HTTP server',
