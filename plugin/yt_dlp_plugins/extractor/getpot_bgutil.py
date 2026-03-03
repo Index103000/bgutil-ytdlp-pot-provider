@@ -39,6 +39,11 @@ class BgUtilPTPBase(PoTokenProvider, abc.ABC):
         PoTokenContext.PLAYER,
         PoTokenContext.SUBS,
     )
+    # 官方将获取 pot 的超时设置为 20秒，但是在 deno 环境下，需要更长时间，
+    # 因为 deno 执行的对象是未 build 的 原始项目中的 ts 文件，运行时需要引入各种包，
+    # 当配置为 20秒 时，容易出现 Timeout expired when trying to run script，
+    # 经测试，当前配置 120秒，基本不会出现 timeout。
+    # 在 node 环境下，由于执行的是 build 后的文件，速度相对会快一些，20秒 可以正常执行。
     _GETPOT_TIMEOUT = 120.0
 
     def _info_and_raise(self, msg, raise_from=None):

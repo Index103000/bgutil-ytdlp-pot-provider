@@ -32,6 +32,11 @@ class BgUtilHTTPPTP(BgUtilPTPBase):
 
     @functools.cached_property
     def _base_url(self):
+        # 直到 20260303 版本，官方 插件未修复 此处bug，导致通过 新插件传参方式无法传 base_url，新方式如下
+        # "youtubepot-bgutilscript": {
+        #     "base_url": ["http://localhost:4416"], # 由于当前插件在 deno + windows 环境下，配置 监听 [::]: 是 ipv6-only 的，因而只能用 localhost ，而不能用 127.0.0.1
+        #     "server_home": [r"D:\code\project\yt-dlp\index103000\bgutil-ytdlp-pot-provider\server"],
+        # }
         base_url = self.ie._configuration_arg(
             ie_key='youtubepot-bgutilscript', key='base_url', default=[None])[0]
 
