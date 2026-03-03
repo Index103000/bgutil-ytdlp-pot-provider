@@ -202,7 +202,6 @@ const options = program.opts();
     // 这两个对象通常很大（尤其 challenge），stdin-json 模式下直接从 payload 拿
     let challengeObj: any | undefined;
     let innertubeContextObj: any | undefined;
-    let disableInnertube: boolean = !!options.disableInnertube;
 
     if (options.stdinJson) {
         const raw = await readAllStdin();
@@ -227,8 +226,6 @@ const options = program.opts();
         challengeObj = payload.challenge;
         innertubeContextObj = payload.innertube_context;
 
-        // 是否禁用 innertube
-        disableInnertube = payload.disable_innertube ?? disableInnertube;
     } else {
         // 兼容 CLI 模式：从命令行参数解析 JSON
         challengeObj = normalizeChallengeFromCli(options.challenge);

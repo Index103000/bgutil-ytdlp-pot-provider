@@ -591,7 +591,6 @@ export class SessionManager {
                 bypass_cache: !!bypassCache,
                 source_address: sourceAddress ?? "",
                 disable_tls_verification: !!disableTlsVerification,
-                disable_innertube: !!disableInnertube,
                 challenge: summarize(challenge),
                 innertube_context: summarize(innertubeContext),
             }),
@@ -799,7 +798,6 @@ export class SessionManager {
         this.logger.log(
             `[${traceId}] generatePoToken:generateTokenMinter ` +
             safeStringify({
-                disable_innertube: !!disableInnertube,
                 challenge: summarize(challenge), // 再打一次摘要，确认进入 minter 时的 challenge 状态
                 innertube_context: summarize(innertubeContext),
             }),

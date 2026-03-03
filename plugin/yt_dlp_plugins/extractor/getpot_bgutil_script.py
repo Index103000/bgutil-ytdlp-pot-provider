@@ -236,17 +236,14 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         command_args.append('--verbose')
 
         # 同步 http 方案 对应参数，确保与 http 方案 参数一致
-        challenge = self._get_attestation(None if disable_innertube else request.video_webpage)
+        challenge = self._get_attestation(request.video_webpage)
         # The challenge is falsy when the webpage and the challenge are unavailable
         # In this case, we need to disable /att/get since it's broken for web_music
         if not challenge and request.internal_client_name == 'web_music':
-            if not disable_innertube:  # if not already set, warn the user
-                self.logger.warning(
-                    'BotGuard challenges could not be obtained from the webpage, '
-                    'overriding disable_innertube=True because InnerTube challenges '
-                    'are currently broken for the web_music client. '
-                    'Pass disable_innertube=1 to suppress this warning.')
-            disable_innertube = True
+            self._warn_and_raise(
+                'BotGuard challenges could not be obtained from the webpage, '
+                'a PO Token cannot be generated because InnerTube challenges '
+                'are currently broken for the web_music client. ')
 
         # 构建“stdin payload”：把所有可能用到的参数统一放进去
         # - 这样脚本端逻辑更像 HTTP body
