@@ -428,6 +428,32 @@ export class SessionManager {
         });
     }
 
+    private normalizeHeaders(input: any): Headers {
+        const h = new Headers();
+
+        // 支持 input 是普通对象 或 Headers
+        const entries: Array<[string, string]> = [];
+        if (input instanceof Headers) {
+            input.forEach((v, k) => entries.push([k, v]));
+        } else if (input && typeof input === "object") {
+            for (const [k, v] of Object.entries(input)) {
+                if (v === undefined || v === null) continue;
+                entries.push([k, String(v)]);
+            }
+        }
+
+        // key 统一小写，后写覆盖前写（同名只留一个）
+        const m = new Map<string, string>();
+        for (const [k, v] of entries) {
+            m.set(k.toLowerCase(), v);
+        }
+
+        for (const [k, v] of m.entries()) {
+            h.set(k, v);
+        }
+        return h;
+    }
+
     private applyParamsToUrl(inputUrl: any, params: any): string {
         // params 为空直接返回原 url
         if (!params || (typeof params === "object" && Object.keys(params).length === 0)) {
@@ -476,9 +502,22 @@ export class SessionManager {
                     if (this._isDenoRuntime()) {
                         const client = this._getDenoHttpClient(proxySpec, logger);
                         const finalUrl = this.applyParamsToUrl(url, options?.params);
+                        // 由于 deno 的 fetch 请求，针对 header 中 重复且大小写不同的 Content-Type 参数，无法正常覆盖，导致最终请求失败
+                        // 从代码层面分析：
+                        // 外层调用时，对应 getHeaders() 里本来就带了 "content-type":"application/json+protobuf"，然后又配置 "Content-Type": "application/json"
+                        // 涉及到的代码如下：
+                        // headers: {
+                        //     ...getHeaders(),
+                        //     "Content-Type": "application/json",
+                        // },
+                        // 不同请求方案对应 header 的处理不同
+                        // • Node(axios) 合并 header 时更倾向“后者覆盖前者/大小写归一”，最终只有一个 content-type
+                        // • Deno(fetch) 直接传了普通对象，可能会把 content-type 和 Content-Type 当成两条 header 发出去，服务端挑了 protobuf 那个，于是报 “不接受 top-level braces”。
+                        // 这里通过 normalizeHeaders 方法，将 header 中的参数进行 小写 + 去重
+                        const headers = this.normalizeHeaders(options?.headers);
                         const resp = await fetch(finalUrl, {
                             method,
-                            headers: options?.headers,
+                            headers: headers,
                             body: options?.body,
                             // Deno 扩展：把 client 传给 fetch
                             client,
@@ -595,29 +634,6 @@ export class SessionManager {
                 innertube_context: summarize(innertubeContext),
             }),
         );
-
-        /**
-         * =========================
-         * contentBinding 兜底逻辑
-         * =========================
-         */
-        if (!contentBinding) {
-            this.logger.log(
-                `[${traceId}] generatePoToken:contentBinding_missing -> generateVisitorData via Innertube`,
-            );
-
-            this.logger.warn(
-                "No content binding provided, generating visitor data via Innertube...",
-            );
-            const visitorData = await this.generateVisitorData();
-            if (!visitorData) throw new Error("Unable to generate visitor data");
-            contentBinding = visitorData;
-
-            this.logger.log(
-                `[${traceId}] generatePoToken:contentBinding_generated ` +
-                safeStringify({content_binding: contentBinding}),
-            );
-        }
 
         /**
          * =========================

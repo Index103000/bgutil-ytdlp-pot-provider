@@ -247,7 +247,7 @@ const options = program.opts();
             bypassCache,
             sourceAddress,
             disableTlsVerification,
-            challengeObj,
+            undefined,
             innertubeContextObj,
         );
 
