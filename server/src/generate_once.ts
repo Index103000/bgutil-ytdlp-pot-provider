@@ -110,6 +110,7 @@ const program = new Command()
     .option("-p, --proxy <proxy-all>")
     .option("-b, --bypass-cache")
     .option("-s, --source-address <source-address>")
+    .option("--innertube-context <innertube-context>")
     .option("--disable-tls-verification")
     .option("--version")
     .option("--verbose")
@@ -117,7 +118,6 @@ const program = new Command()
     // ===== 兼容 CLI 模式=====
     .option("--challenge <challenge>", "Challenge JSON string (legacy CLI mode)")
     .option("--disable-innertube", "Disable innertube challenge flow (legacy CLI mode)")
-    .option("--innertube-context <innertube-context>", "Innertube context JSON string (legacy CLI mode)")
 
     // ===== stdin-json 模式=====
     .option("--stdin-json", "Read all options as JSON from stdin (recommended on Windows to avoid argv length limits)")
@@ -252,7 +252,6 @@ const options = program.opts();
             sourceAddress,
             disableTlsVerification,
             challengeObj,
-            disableInnertube,
             innertubeContextObj,
         );
 

@@ -13,7 +13,6 @@ import { Agent } from "node:https";
 import { ProxyAgent } from "proxy-agent";
 import { JSDOM } from "jsdom";
 import { Innertube, Context as InnertubeContext } from "youtubei.js";
-import { strerror } from "./utils.ts";
 
 interface YoutubeSessionData {
     poToken: string;
@@ -227,17 +226,6 @@ export class SessionManager {
         this.youtubeSessionDataCaches = youtubeSessionData;
     }
 
-    public async generateVisitorData(): Promise<string | null> {
-        const innertube = await Innertube.create({ retrieve_player: false });
-        const visitorData = innertube.session.context.client.visitorData;
-        if (!visitorData) {
-            this.logger.error("Unable to generate visitor data via Innertube");
-            return null;
-        }
-
-        return visitorData;
-    }
-
     public get minterCache(): MinterCache {
         return this._minterCache;
     }
@@ -246,13 +234,9 @@ export class SessionManager {
         bgConfig: BgConfig,
         challenge?: ChallengeData,
         innertubeContext?: InnertubeContext,
-        disableInnertube?: boolean,
     ): Promise<DescrambledChallenge> {
         try {
-            if (disableInnertube) throw null;
             if (!challenge) {
-                if (!innertubeContext)
-                    throw new Error("Innertube context unavailable");
                 this.logger.debug("Using challenge from /att/get");
                 const attGetResponse = await bgConfig.fetch(
                     "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false",
@@ -263,7 +247,12 @@ export class SessionManager {
                             "Content-Type": "application/json",
                         },
                         body: JSON.stringify({
-                            context: innertubeContext,
+                            context: innertubeContext || {
+                                client: {
+                                    clientName: "WEB",
+                                    clientVersion: "2.20260227.01.00",
+                                },
+                            },
                             engagementType: "ENGAGEMENT_TYPE_UNBOUND",
                         }),
                     },
@@ -293,25 +282,7 @@ export class SessionManager {
                 },
             };
         } catch (e) {
-            if (e === null)
-                this.logger.debug(
-                    "Using the /Create endpoint as innertube challenges are disabled",
-                );
-            else
-                this.logger.warn(
-                    `Failed to get descrambled challenge from Innertube, trying the /Create endpoint. (caused by ${strerror(e)})`,
-                );
-            try {
-                const descrambledChallenge =
-                    await BG.Challenge.create(bgConfig);
-                if (descrambledChallenge) return descrambledChallenge;
-            } catch (eInner) {
-                throw new Error(
-                    `Error while attempting to retrieve BG challenge.`,
-                    { cause: eInner },
-                );
-            }
-            throw new Error("Could not get Botguard challenge");
+            throw new Error("Could not get BotGuard challenge", { cause: e });
         }
     }
 
@@ -320,13 +291,11 @@ export class SessionManager {
         bgConfig: BgConfig,
         challenge?: ChallengeData,
         innertubeContext?: InnertubeContext,
-        disableInnertube?: boolean,
     ): Promise<TokenMinter> {
         const descrambledChallenge = await this.getDescrambledChallenge(
             bgConfig,
             challenge,
             innertubeContext,
-            disableInnertube,
         );
 
         const { program, globalName } = descrambledChallenge;
@@ -559,7 +528,6 @@ export class SessionManager {
         sourceAddress: string | undefined = undefined,
         disableTlsVerification: boolean = false,
         challenge: ChallengeData | undefined = undefined,
-        disableInnertube: boolean = false,
         innertubeContext?: InnertubeContext,
     ): Promise<YoutubeSessionData> {
         // 生成一次调用的 traceId，方便 grep / 对比（不要求全局唯一，但足够区分）
@@ -668,7 +636,6 @@ export class SessionManager {
             sourceAddress,
             disableTlsVerification,
         });
-
         if (proxy) {
             pxySpec.proxy = proxy;
             this.logger.log(
@@ -677,7 +644,9 @@ export class SessionManager {
             );
         } else {
             pxySpec.proxy =
-                process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+                process.env.HTTPS_PROXY ||
+                process.env.HTTP_PROXY ||
+                process.env.ALL_PROXY;
 
             this.logger.log(
                 `[${traceId}] generatePoToken:proxy_selected from_env ` +
@@ -693,14 +662,15 @@ export class SessionManager {
          * - cacheSpec 的 key 如果不同，会导致一边走缓存/复用 minter，另一边重新生成
          * - remoteHost 缺失/不同也会影响 key
          */
-        const remoteHost = innertubeContext?.client?.remoteHost || null;
-
-        const cacheSpec = new CacheSpec(pxySpec, remoteHost);
+        const cacheSpec = new CacheSpec(
+            pxySpec,
+            innertubeContext?.client.remoteHost || null,
+        );
 
         this.logger.log(
             `[${traceId}] generatePoToken:cacheSpec ` +
             safeStringify({
-                remoteHost: remoteHost ?? "",
+                remoteHost: innertubeContext?.client.remoteHost || null,
                 cacheKey: (cacheSpec as any)?.key ?? "<no_key_field>",
             }),
         );
@@ -710,8 +680,32 @@ export class SessionManager {
          * BgConfig
          * =========================
          */
+        const bgFetch = this.getFetch(pxySpec, 3, 5000);
+        let innertube: Innertube | undefined = undefined;
+        if (!contentBinding && innertubeContext) {
+            this.logger.warn(
+                "No content binding provided, using the one from the supplied Innertube context...",
+            );
+            contentBinding = innertubeContext.client.visitorData;
+        }
+
+        if (!contentBinding) {
+            this.logger.warn(
+                "No content binding provided, generating visitor data via Innertube...",
+            );
+            innertube = await Innertube.create({
+                retrieve_player: false,
+                fetch: bgFetch,
+            });
+            contentBinding = innertube.session.context.client.visitorData;
+        }
+
+        if (!contentBinding) throw new Error("Unable to generate visitor data");
+
+        if (!innertubeContext) innertubeContext = innertube?.session.context;
+
         const bgConfig: BgConfig = {
-            fetch: this.getFetch(pxySpec, 3, 5000),
+            fetch: bgFetch,
             globalObj: globalThis,
             identifier: contentBinding,
             requestKey: SessionManager.REQUEST_KEY,
@@ -733,7 +727,8 @@ export class SessionManager {
         if (!bypassCache) {
             // 1) JSON cache（youtubeSessionDataCaches）
             if (this.youtubeSessionDataCaches) {
-                const sessionData = this.youtubeSessionDataCaches[contentBinding];
+                const sessionData =
+                    this.youtubeSessionDataCaches[contentBinding];
                 if (sessionData) {
                     this.logger.log(
                         `[${traceId}] generatePoToken:hit_youtubeSessionDataCaches -> return_cached_token`,
@@ -778,7 +773,6 @@ export class SessionManager {
                         bgConfig,
                         challenge,
                         innertubeContext,
-                        disableInnertube,
                     );
                 } else {
                     this.logger.log(
@@ -816,7 +810,6 @@ export class SessionManager {
             bgConfig,
             challenge,
             innertubeContext,
-            disableInnertube,
         );
 
         this.logger.log(`[${traceId}] generatePoToken:tryMintPOT(new_minter)`);

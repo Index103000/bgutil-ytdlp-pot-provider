@@ -30,11 +30,17 @@ jobs:
       - name: Python lint check (autopep8)
         if: always()
         run: autopep8 --diff plugin/
-      - name: Install server dependencies
+      - name: Install Node
+        uses: actions/setup-node@v6
+        if: always()
+        with:
+          node-version: "25" # minimum supported version
+      - name: Check and install server dependencies
         if: always()
         run: |
           cd server
           npm ci --no-audit --no-fund
+          node scripts/check_lockfiles.ts
       - name: Server lint check (ESlint)
         if: always()
         run: cd server && npx eslint --max-warnings=0 src/

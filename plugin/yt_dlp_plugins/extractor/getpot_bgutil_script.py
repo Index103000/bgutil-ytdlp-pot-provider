@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import sysconfig
-from typing import Iterable, TypeVar
+from typing import Iterable
 
 from yt_dlp.extractor.youtube.pot.provider import (
     PoTokenProviderError,
@@ -18,12 +18,11 @@ from yt_dlp.extractor.youtube.pot.provider import (
     register_provider,
 )
 from yt_dlp.extractor.youtube.pot.utils import get_webpo_content_binding
-from yt_dlp.utils import Popen, int_or_none
+from yt_dlp.utils import Popen, int_or_none, shell_quote
 from yt_dlp.utils.traversal import traverse_obj
 
 from yt_dlp_plugins.extractor.getpot_bgutil import BgUtilPTPBase
 
-T = TypeVar('T')
 _FALLBACK_PATHEXT = ('.COM', '.EXE', '.BAT', '.CMD')
 
 
@@ -158,22 +157,13 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         super().__init__(*args, **kwargs)
         self._check_script = functools.cache(self._check_script_impl)
 
-    def _base_config_arg(self, key: str, default: T = None) -> str | T:
-        return self.ie._configuration_arg(
-            ie_key='youtubepot-bgutilscript', key=key, default=[default])[0]
-
     @functools.cached_property
     def _server_home(self) -> str:
-        resolve_path = lambda *ps: os.path.abspath(
-            os.path.expanduser(os.path.expandvars(os.path.join(*ps))))
-        if server_home := self._base_config_arg('server_home'):
-            return resolve_path(server_home)
-
-        if script_path := self._base_config_arg('script_path'):
-            return resolve_path(script_path, os.pardir, os.pardir)
+        if path := self._script_path_provided():
+            return path
 
         # default if no arg was passed
-        default_home = resolve_path('~', 'bgutil-ytdlp-pot-provider', 'server')
+        default_home = self._resolve_script_path('~', 'bgutil-ytdlp-pot-provider', 'server')
         self.logger.debug(
             f'No server_home or script_path passed, defaulting to {default_home}', once=True)
         return default_home
@@ -246,7 +236,6 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         command_args.append('--verbose')
 
         # 同步 http 方案 对应参数，确保与 http 方案 参数一致
-        disable_innertube = bool(self._base_config_arg('disable_innertube'))
         challenge = self._get_attestation(None if disable_innertube else request.video_webpage)
         # The challenge is falsy when the webpage and the challenge are unavailable
         # In this case, we need to disable /att/get since it's broken for web_music
@@ -267,7 +256,6 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             'bypass_cache': request.bypass_cache,
             'challenge': challenge,  # 这里是对象/字符串/None，直接塞进去，json.dumps 会处理
             'content_binding': get_webpo_content_binding(request)[0],
-            'disable_innertube': disable_innertube,
             'disable_tls_verification': not request.request_verify_tls,
             'proxy': request.request_proxy,
             'innertube_context': request.innertube_context,
@@ -288,7 +276,7 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             f'{request.internal_client_name} client via bgutil script',
         )
         self.logger.debug(
-            f'Executing command to get POT via script: {" ".join(command_args)}')
+            f'Executing command to get POT via script: {" ".join(map(shell_quote, command_args))}')
 
         try:
             # stdout, _, returncode = Popen.run(
