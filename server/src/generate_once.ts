@@ -247,7 +247,15 @@ const options = program.opts();
             bypassCache,
             sourceAddress,
             disableTlsVerification,
-            undefined,
+            // 官方使用 script 模式 时，默认配置 这里的 challenge 参数为 undefined，这点与 http 模式不一致。
+            // 我猜测是 challenge 内容过大，通过 官方 使用的 传统 shell 参数传递方案 无法传递，
+            // 而我这里改版 shell 参数传递方案为 stdin 方案，解决了这个问题，因而这里就可以跟 http 模式参数一致，直接通过参数传入 challenge。
+            // 由此产生的好处是，因为通过参数传入了 challenge 内容，因而无需在通过 /att/get 接口再次请求，节省 pot 生成时间。
+            // 关于 challenge 的 /att/get 接口请求，参考 session_manager.ts 中的 getDescrambledChallenge 方法，
+            // 通过对源码分析，确定了对应 challenge 获取逻辑为：若不通过参数传递，则会通过请求 /att/get 接口，获取 challenge，
+            // 需要注意的是，challenge 是必须要获取的，否则无法生成 pot，并抛出异常 Could not get BotGuard challenge。
+            // 若打开日志，则会明确打印 challenge 来源，如：Using challenge from /att/get 或 Using challenge from the webpage。
+            challengeObj,
             innertubeContextObj,
         );
 
