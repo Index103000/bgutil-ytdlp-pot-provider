@@ -2,8 +2,8 @@ name: Run tests
 on:
   workflow_dispatch:
   pull_request:
-  push:
-    branches: [master]
+#  push:
+#    branches: [fix]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
