@@ -245,6 +245,24 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
                 'a PO Token cannot be generated because InnerTube challenges '
                 'are currently broken for the web_music client. ')
 
+        # 需要先明确的是，若在不登录的状态下，GVS POT 生成，默认是绑定 visitor_data 生成的，具体说明参见：https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide#po-tokens-for-gvs。
+        # 经测试，web_safari 在请求 GVS POT 时，即使不登录，也需要走绑定 video_id 的 POT 生成逻辑才有效。
+        # 而在不登录状态下，web、mweb、web_safari 目前似乎也需要走 绑定 video_id 的 POT 逻辑，而针对这一点，yt-dlp 进行了兼容，因为它们有明显的特征，就是在 ytcfg 中会 开启实验性质开关。
+        # 由此，web、mweb、web_music 等在请求 GVS POT 时，会因为 开启实验性质开关，yt-dlp 走了特殊处理，所以才让 GVS POT 也在不登录时，走 绑定 video_id 的逻辑。
+        # 但是在进行 get_webpo_content_binding 判断时，web_safari 不像 web、mweb、web_music 等，开启了实验开关，因而 POT 绑到 visitor_data，从而无效。
+        # 为了让 web_safari 可以生成有效 POT，这里遵循 yt-dlp 对 web 等的同样的处理方案进行处理，这样代码兼容性最强。
+        # yt-dlp 特殊处理的具体方案为：
+        # 对 开启实验开关 的 client，yt-dlp 会通过在 request 中，配置 _gvs_bind_to_video_id=True ，强行将其 GVS POT 生成 绑定到 video_id，而不是 visitor_data。
+        # 对应的 源码 参考：yt_dlp/extractor/youtube/_video.py 中 fetch_po_token 方法，
+        # 其中对 gvs_bind_to_video_id 由默认 False 改为 True 的处理逻辑如下：
+        # 1. 从 ytcfg 里拿到所有 client 的 serializedExperimentFlags
+        # 2. 把 flag 字符串解析成 query dict
+        # 3. 查找 html5_generate_content_po_token 是否有值 true
+        # if 存在实验开关 html5_generate_content_po_token=true: 则 gvs_bind_to_video_id = True
+        # 所以，在不修改 yt-dlp 源码的情况下，在插件中，可以针对 web_safari，配置开启 gvs_bind_to_video_id，从而解决 web_safari GVS POT 无效的问题。
+        if request.internal_client_name == 'web_safari':
+            request._gvs_bind_to_video_id = True
+
         # 构建“stdin payload”：把所有可能用到的参数统一放进去
         # - 这样脚本端逻辑更像 HTTP body
         # - 也避免 argv 在不同 OS 上的 quoting / escaping 坑
