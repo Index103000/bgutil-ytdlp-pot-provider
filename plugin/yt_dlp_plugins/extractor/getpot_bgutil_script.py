@@ -245,21 +245,31 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
                 'a PO Token cannot be generated because InnerTube challenges '
                 'are currently broken for the web_music client. ')
 
-        # 需要先明确的是，若在不登录的状态下，GVS POT 生成，默认是绑定 visitor_data 生成的，具体说明参见：https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide#po-tokens-for-gvs。
+        # 需要先明确的是，若在不登录的状态下，GVS POT 生成，默认是绑定 visitor_data 生成的，具体说明参见：
+        # https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide#po-tokens-for-gvs
+        #
         # 经测试，web_safari 在请求 GVS POT 时，即使不登录，也需要走绑定 video_id 的 POT 生成逻辑才有效。
-        # 而在不登录状态下，web、mweb、web_music 目前似乎也需要走 绑定 video_id 的 POT 逻辑，而针对这一点，yt-dlp 进行了兼容，因为它们有明显的特征，就是在 ytcfg 中会 开启实验性质开关。
-        # 由此，web、mweb、web_music 等在请求 GVS POT 时，会因为 开启实验性质开关，yt-dlp 走了特殊处理，所以才让 GVS POT 也在不登录时，走 绑定 video_id 的逻辑。
-        # 但是在进行 get_webpo_content_binding 判断时，web_safari 不像 web、mweb、web_music 等，开启了实验开关，因而 POT 绑到 visitor_data，从而无效。
+        # 而在不登录状态下，web、mweb、web_music 目前似乎也需要走绑定 video_id 的 POT 逻辑，
+        # 针对这一点，yt-dlp 进行了兼容，因为它们有明显的特征，就是在 ytcfg 中会 开启实验性质开关。
+        # 由此，web、mweb、web_music 等在请求 GVS POT 时，会因为 开启实验性质开关，yt-dlp 走了特殊处理，
+        # 所以才让 GVS POT 也在不登录时，走 绑定 video_id 的逻辑。
+        #
+        # 但是在进行 get_webpo_content_binding 判断时，web_safari 不像 web、mweb、web_music 等，开启了实验开关，
+        # 因而 POT 绑到 visitor_data，从而无效。
         # 为了让 web_safari 可以生成有效 POT，这里遵循 yt-dlp 对 web 等 切换为 绑定 video_id 的同样的处理方案进行处理，这样代码兼容性最强。
+        #
         # yt-dlp 特殊处理的具体方案为：
-        # 对 开启实验开关 的 client，yt-dlp 会通过在 request 中，配置 _gvs_bind_to_video_id=True ，强行将其 GVS POT 生成 绑定到 video_id，而不是 visitor_data。
+        # 对 开启实验开关 的 client，yt-dlp 会通过在 request 中，配置 _gvs_bind_to_video_id=True ，
+        # 强行将其 GVS POT 生成 绑定到 video_id，而不是 visitor_data。
         # 对应的 源码 参考：yt_dlp/extractor/youtube/_video.py 中 fetch_po_token 方法，
         # 其中对 gvs_bind_to_video_id 由默认 False 改为 True 的处理逻辑如下：
         # 1. 从 ytcfg 里拿到所有 client 的 serializedExperimentFlags
         # 2. 把 flag 字符串解析成 query dict
         # 3. 查找 html5_generate_content_po_token 是否有值 true
         # if 存在实验开关 html5_generate_content_po_token=true: 则 gvs_bind_to_video_id = True
-        # 所以，在不修改 yt-dlp 源码的情况下，在插件中，可以针对 web_safari，配置开启 gvs_bind_to_video_id，从而解决 web_safari GVS POT 无效的问题。
+        #
+        # 所以，在不修改 yt-dlp 源码的情况下，在插件中，可以针对 web_safari，配置开启 gvs_bind_to_video_id，
+        # 从而解决 web_safari GVS POT 无效的问题。
         if request.internal_client_name == 'web_safari':
             request._gvs_bind_to_video_id = True
 
@@ -269,7 +279,7 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         payload = {
             # 与 HTTP server 一致的字段命名，便于脚本端复用解析逻辑
             'bypass_cache': request.bypass_cache,
-            'challenge': challenge,  # 这里是对象/字符串/None，直接塞进去，json.dumps 会处理
+            'challenge': challenge,  # 这里可能是对象 / 字符串 / None
             'content_binding': get_webpo_content_binding(request)[0],
             'disable_tls_verification': not request.request_verify_tls,
             'proxy': request.request_proxy,
@@ -278,10 +288,17 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         }
         # 序列化 payload
         # - ensure_ascii=False：保留非 ASCII（虽然这里主要是英文，但保持一致）
-        # - separators：去掉空格，减小体积（虽然 stdin 不怕长，但更省）
+        # - separators：去掉多余空格，减小体积（虽然 stdin 不怕长，但更省）
         payload_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        # 打印 payload
-        self.logger.trace(f'stdin payload={payload_str}')
+
+        # 构造“仅用于日志打印”的 payload 副本
+        # 注意：
+        # - 这里会对超长字段做结构化截断
+        # - 不影响真正写入 stdin 的 payload_str
+        payload_log_obj = self._payload_for_log(payload)
+        payload_log_str = json.dumps(payload_log_obj, ensure_ascii=False, separators=(",", ":"))
+        self.logger.trace(f'script payload={payload_log_str}')
+
         # 加一个短开关，告诉脚本“从 stdin 读取 JSON payload”
         # 这个参数非常短，不会触发命令行长度限制
         command_args.append('--stdin-json')
@@ -322,8 +339,8 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
 
         if stdout_extra := stdout_lines:
             # self.logger.trace(f'script stdout:\n{stdout_extra}')
-            # stdout_extra 是 list，直接 f-string 会变成 ['line1', 'line2'] 这种一行，不直观
-            # 改成更明确可见的输出（逐行输出）：
+            # stdout_extra 是 list，直接 f-string 会变成 ['line1', 'line2'] 这种一行，不直观，改成更明确可见的输出（逐行输出）
+            # 同时对每一行做一次字符串截断，避免脚本端也打印超长内容时刷屏。
             for line in stdout_extra:
                 self.logger.trace(f'script stdout: {line}')
         if returncode:
@@ -337,9 +354,11 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
         except json.JSONDecodeError as e:
             raise PoTokenProviderError(
                 f'Error parsing JSON response from _get_pot_via_script (caused by {e!r})') from e
+
         if 'poToken' not in script_data_resp:
             raise PoTokenProviderError(
                 'The script did not respond with a po_token')
+
         return PoTokenResponse(po_token=script_data_resp['poToken'])
 
 
