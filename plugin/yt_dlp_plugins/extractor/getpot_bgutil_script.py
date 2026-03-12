@@ -392,14 +392,72 @@ class BgUtilScriptDenoPTP(BgUtilScriptPTPBase):
             self._server_home, 'src', self._SCRIPT_BASENAME)
 
     def _jsrt_args(self) -> Iterable[str]:
+        """
+        为 Deno 运行 generate_once.ts 组装权限参数。
+
+        设计目标：
+        1) 兼容 release 目录中的软链路径
+        2) 兼容软链展开后的真实路径
+        3) 避免 jsdom / node_modules/.deno/... 读取静态资源时触发 NotCapable
+
+        为什么要同时放行“原路径 + realpath”：
+        - 主程序可能把 bgutil server_home 配成：
+            /opt/yt-downloader/releases/<release>/yt-dlp-plugins/.../work/server
+        - 但 Deno 在内部模块解析 / fs 访问时，可能会落到：
+            /opt/yt-downloader/yt-dlp-plugins/.../work/server
+        - 若 allow-read 只授权前者，访问后者时就会报权限错误。
+
+        因此这里统一策略为：
+        - server_home、node_modules、cache_dir 都同时授权：
+            * abspath
+            * realpath
+        """
+
         def escpath(*strs: str):
-            return ','.join(s.replace(',', ',,') for s in strs)
-        node_mods_path = os.path.join(self._server_home, 'node_modules')
+            # Deno 的 allow-* 支持逗号分隔多个路径；
+            # 如果路径中本身出现逗号，需要转义成 ",,"
+            return ','.join(s.replace(',', ',,') for s in strs if s)
+
+        # server 根目录
+        server_home = os.path.abspath(self._server_home)
+        server_home_real = os.path.realpath(server_home)
+
+        # node_modules 目录
+        node_mods_path = os.path.join(server_home, 'node_modules')
+        node_mods_path = os.path.abspath(node_mods_path)
+        node_mods_path_real = os.path.realpath(node_mods_path)
+
+        # 脚本缓存目录
+        script_cache_dir = os.path.abspath(self._script_cache_dir)
+        script_cache_dir_real = os.path.realpath(script_cache_dir)
+
+        # 便于排查权限问题时看日志
+        self.logger.trace(
+            'Deno permission paths: '
+            f'server_home={server_home}, '
+            f'server_home_real={server_home_real}, '
+            f'node_modules={node_mods_path}, '
+            f'node_modules_real={node_mods_path_real}, '
+            f'cache_dir={script_cache_dir}, '
+            f'cache_dir_real={script_cache_dir_real}'
+        )
+
         return (
-            'run', '--allow-env', '--allow-net',
-            f'--allow-ffi={escpath(node_mods_path)}',
-            f'--allow-write={escpath(self._script_cache_dir)}',
-            f'--allow-read={escpath(self._script_cache_dir, node_mods_path)}',
+            'run',
+            '--allow-env',
+            '--allow-net',
+
+            # FFI 主要给 node_modules 下的原生模块使用
+            f'--allow-ffi={escpath(node_mods_path, node_mods_path_real)}',
+
+            # cache 写权限
+            f'--allow-write={escpath(script_cache_dir, script_cache_dir_real)}',
+
+            # 读权限要尽量覆盖完整：
+            # - server 根目录：覆盖 src / package.json / deno.lock / node_modules 等
+            # - node_modules：显式补一层
+            # - cache_dir：缓存读取
+            f'--allow-read={escpath(server_home, server_home_real, node_mods_path, node_mods_path_real, script_cache_dir, script_cache_dir_real)}',
         )
 
 
