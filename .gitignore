@@ -27,3 +27,4 @@ yt-dlp/
 cache.json
 .idea
 work
+uv.lock
