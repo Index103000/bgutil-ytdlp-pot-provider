@@ -446,6 +446,7 @@ class BgUtilScriptDenoPTP(BgUtilScriptPTPBase):
             'run',
             '--allow-env',
             '--allow-net',
+            '--allow-sys',
 
             # FFI 主要给 node_modules 下的原生模块使用
             f'--allow-ffi={escpath(node_mods_path, node_mods_path_real)}',

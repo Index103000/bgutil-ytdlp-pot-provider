@@ -12,18 +12,47 @@ import {
 import { Agent } from "node:https";
 import { ProxyAgent } from "proxy-agent";
 import { JSDOM } from "jsdom";
+import * as path from "node:path";
 import { Innertube, Context as InnertubeContext } from "youtubei.js";
 
-interface YoutubeSessionData {
-    poToken: string;
-    contentBinding: string;
-    expiresAt: Date;
-}
+import {
+    buildYoutubeSessionData,
+    getBgutilCacheDir,
+    getCacheEntryLock,
+    getYoutubeSessionDataLocked,
+    setYoutubeSessionDataLocked,
+    type YoutubeSessionData,
+    type CacheEntryLock,
+} from "./cache_store.ts";
+import { ResourceGate } from "./resource_gate.ts";
 
-export interface YoutubeSessionDataCaches {
+/**
+ * 进程内“按 contentBinding 索引”的 POT 缓存。
+ *
+ * 说明：
+ * - 这是当前 Node / Deno 进程内的内存缓存
+ * - 与磁盘缓存不同，它不会跨进程共享
+ * - 现在它作为“二级缓存”保留：
+ *   1. 先查磁盘缓存（跨进程共享）
+ *   2. 再查当前进程内缓存
+ *   3. 最后再真正生成
+ */
+interface YoutubeSessionDataCaches {
     [contentBinding: string]: YoutubeSessionData;
 }
 
+/**
+ * 简单日志封装。
+ *
+ * 设计目标：
+ * - shouldLog=true 时，debug/log 生效
+ * - shouldLog=false 时，debug/log 静默
+ * - warn/error 始终输出
+ *
+ * 说明：
+ * - 当前仍保持你原先的实现风格
+ * - 后续若接统一 logger，可在这里集中替换
+ */
 class Logger {
     readonly debug: (msg: string) => void;
     readonly log: (msg: string) => void;
@@ -50,14 +79,32 @@ class Logger {
     }
 }
 
+/**
+ * 代理配置规格。
+ *
+ * 字段说明：
+ * - proxyUrl:
+ *   规范化后的代理 URL
+ * - sourceAddress:
+ *   本地源地址（若指定）
+ * - disableTlsVerification:
+ *   是否禁用 TLS 校验
+ * - ipFamily:
+ *   若 sourceAddress 指定，则推断为 IPv4 / IPv6
+ *
+ * 说明：
+ * - 这里主要负责“代理相关参数的规范化与 https agent / proxy agent 创建”
+ */
 class ProxySpec {
     public proxyUrl?: URL;
     public sourceAddress?: string;
     public disableTlsVerification: boolean = false;
     public readonly ipFamily?: number;
+
     constructor({ sourceAddress, disableTlsVerification }: Partial<ProxySpec>) {
         this.sourceAddress = sourceAddress;
         this.disableTlsVerification = disableTlsVerification || false;
+
         if (!this.sourceAddress) {
             this.ipFamily = undefined;
         } else {
@@ -70,28 +117,39 @@ class ProxySpec {
     }
 
     public set proxy(newProxy: string | undefined) {
-        if (newProxy) {
-            // Normalize and sanitize the proxy URL
+        if (!newProxy) {
+            this.proxyUrl = undefined;
+            return;
+        }
+
+        try {
+            this.proxyUrl = new URL(newProxy);
+        } catch {
+            const fallback = `http://${newProxy}`;
             try {
-                this.proxyUrl = new URL(newProxy);
-            } catch {
-                newProxy = `http://${newProxy}`;
-                try {
-                    this.proxyUrl = new URL(newProxy);
-                } catch (e) {
-                    throw new Error(`Invalid proxy URL: ${newProxy}`, {
-                        cause: e,
-                    });
-                }
+                this.proxyUrl = new URL(fallback);
+            } catch (e) {
+                throw new Error(`Invalid proxy URL: ${fallback}`, {
+                    cause: e,
+                });
             }
         }
     }
 
+    /**
+     * 构造 Node 路径下使用的 https dispatcher / proxy agent。
+     *
+     * 说明：
+     * - 无代理时，直接返回 https.Agent
+     * - 有代理时，返回 ProxyAgent
+     * - 日志中会隐藏代理密码
+     */
     public asDispatcher(
         this: Readonly<this>,
         logger: Logger,
     ): Agent | undefined {
         const { proxyUrl, sourceAddress, disableTlsVerification } = this;
+
         if (!proxyUrl) {
             return new Agent({
                 localAddress: sourceAddress,
@@ -99,7 +157,8 @@ class ProxySpec {
                 rejectUnauthorized: !disableTlsVerification,
             });
         }
-        // Proxy must be a string as long as the URL is truthy
+
+        // 只要 proxyUrl 存在，这里 proxy 一定是可用字符串
         const pxyStr = this.proxy!;
         const { password } = proxyUrl;
 
@@ -108,6 +167,7 @@ class ProxySpec {
             : pxyStr;
 
         logger.log(`Using proxy: ${loggedProxy}`);
+
         try {
             return new ProxyAgent({
                 getProxyForUrl: () => pxyStr,
@@ -123,11 +183,32 @@ class ProxySpec {
     }
 }
 
+/**
+ * minter 级缓存 key 规格。
+ *
+ * 说明：
+ * - bgutil 的 _minterCache 不是按 contentBinding 存，而是按“网络环境”存
+ * - 当前 key 由以下信息构成：
+ *   1. remoteHost（若存在）
+ *   2. 否则退化为 [proxy, sourceAddress]
+ *
+ * 这与上层的“磁盘 POT 缓存按 contentBinding 存”是两层不同粒度的缓存：
+ * - 磁盘缓存：缓存最终 poToken
+ * - _minterCache：缓存 token minter
+ */
 class CacheSpec {
     constructor(
         public pxySpec: ProxySpec,
         public ip: string | null,
     ) {}
+
+    /**
+     * 进程内 minterCache 的 key。
+     *
+     * 说明：
+     * - 当前逻辑保持与原实现一致
+     * - 这个 key 主要用于区分“代理 / sourceAddress / remoteHost”等环境差异
+     */
     public get key(): string {
         return JSON.stringify(
             this.ip || [this.pxySpec.proxy, this.pxySpec.sourceAddress],
@@ -135,14 +216,43 @@ class CacheSpec {
     }
 }
 
+/**
+ * token minter 缓存条目。
+ *
+ * 字段说明：
+ * - expiry:
+ *   当前 minter 失效时间
+ * - integrityToken:
+ *   生成 minter 时拿到的 integrity token
+ * - minter:
+ *   真正用于 mint POT 的 WebPoMinter
+ */
 type TokenMinter = {
     expiry: Date;
     integrityToken: string;
     minter: BG.WebPoMinter;
 };
 
+/**
+ * 进程内 minter 缓存。
+ *
+ * key:
+ * - CacheSpec.key
+ *
+ * value:
+ * - TokenMinter
+ */
 type MinterCache = Map<string, TokenMinter>;
 
+/**
+ * challenge 数据结构。
+ *
+ * 说明：
+ * - 当前沿用你现有项目中的 challenge 结构定义
+ * - 主要用于：
+ *   1. 直接使用网页里带的 challenge
+ *   2. 若缺失，则再走 /att/get 获取
+ */
 export type ChallengeData = {
     interpreterUrl: {
         privateDoNotAccessOrElseTrustedResourceUrlWrappedValue: string;
@@ -154,22 +264,114 @@ export type ChallengeData = {
 };
 
 export class SessionManager {
-    // hardcoded API key that has been used by youtube for years
+    /**
+     * hardcoded API key that has been used by youtube for years
+     */
     private static readonly REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
+
+    /**
+     * 是否已经初始化过全局 DOM 环境。
+     *
+     * 说明：
+     * - BG client 运行依赖浏览器环境对象
+     * - 这里通过 JSDOM 只初始化一次，避免重复污染 globalThis
+     */
     private static hasDom = false;
+
+    /**
+     * 进程内 minter 缓存。
+     *
+     * 说明：
+     * - 这是当前进程私有缓存
+     * - 不跨进程共享
+     * - 会在“磁盘 POT 缓存 miss”后作为二级缓存继续生效
+     */
     private _minterCache: MinterCache = new Map();
-    private TOKEN_TTL_HOURS: number;
-    private logger: Logger;
+
+    /**
+     * 当前进程内的 sessionData 缓存。
+     *
+     * 说明：
+     * - 这是“进程内缓存”
+     * - 与磁盘缓存并存
+     * - 保留这个结构，便于快速命中同进程内的重复请求
+     */
+    private youtubeSessionDataCaches: YoutubeSessionDataCaches = {};
+
+    /**
+     * POT TTL（小时）。
+     *
+     * 默认：
+     * - 取环境变量 TOKEN_TTL
+     * - 否则默认为 6
+     */
+    private readonly TOKEN_TTL_HOURS: number;
+
+    /**
+     * 当前 SessionManager 使用的磁盘缓存根目录。
+     *
+     * 目录示例：
+     *   ~/.cache/bgutil-ytdlp-pot-provider
+     *
+     * 内部结构由 cache_store.ts 自己维护：
+     *   entries/
+     *   locks/
+     */
+    private readonly cachedir: string;
+
+    /**
+     * 当前 SessionManager 统一使用的资源门禁。
+     *
+     * 说明：
+     * - script 模式与 http 模式都会走到这里
+     * - 因此只要调用 generatePoToken()，就都会遵循同一套资源限制
+     */
+    private readonly resourceGate: ResourceGate;
+
+    /**
+     * 日志对象。
+     */
+    private readonly logger: Logger;
 
     constructor(
         shouldLog = true,
-        // This needs to be reworked as POTs are IP-bound
-        private youtubeSessionDataCaches?: YoutubeSessionDataCaches,
+        /**
+         * 可选 cachedir。
+         *
+         * 说明：
+         * - 若外部显式传入，则优先使用外部传入值
+         * - 若未传，则内部自动按 XDG / HOME / USERPROFILE 规则计算默认目录
+         * - 这样 generate_once.ts 与 main.ts 都不需要再各自决定缓存目录
+         */
+        cachedir?: string,
     ) {
         this.logger = new Logger(shouldLog);
+
         this.TOKEN_TTL_HOURS = process.env.TOKEN_TTL
             ? parseInt(process.env.TOKEN_TTL)
             : 6;
+
+        /**
+         * cachedir 的优先级规则：
+         * 1. 外部显式传入 -> 直接使用
+         * 2. 未传 -> 按 cache_store.ts 内部默认规则自动计算
+         *
+         * 注意：
+         * - 这里不能直接写成 getBgutilCacheDir(cachedir)
+         * - 因为 getBgutilCacheDir 的参数语义更接近“fallbackDir”
+         * - 若这里直接把显式 cachedir 传进去，会让“显式传入目录”失去最高优先级
+         */
+        this.cachedir = cachedir ? path.resolve(cachedir) : getBgutilCacheDir();
+
+        this.resourceGate = this.buildBgutilResourceGate();
+
+        /**
+         * 初始化一次全局 DOM 环境。
+         *
+         * 说明：
+         * - BG client / 某些网页脚本执行依赖 window/document/location/navigator 等对象
+         * - 这里统一用 JSDOM 做一次全局补齐
+         */
         if (!SessionManager.hasDom) {
             const dom = new JSDOM(
                 '<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>',
@@ -192,44 +394,127 @@ export class SessionManager {
                     value: dom.window.navigator,
                 });
             }
+
             SessionManager.hasDom = true;
         }
     }
 
+    /**
+     * 构造 bgutil 使用的统一资源门禁。
+     *
+     * 当前目录布局：
+     *   <cachedir>/resource_gate
+     *
+     * 说明：
+     * - 不把 resource_gate 放到外层入口维护
+     * - 而是直接下沉到 SessionManager
+     * - 这样 script / http 两条链路天然共用
+     */
+    private buildBgutilResourceGate(): ResourceGate {
+        return new ResourceGate({
+            gateName: "bgutil_generate_pot",
+            baseDir: path.resolve(this.cachedir, "resource_gate"),
+
+            /**
+             * 以下参数当前先给一个偏保守默认值：
+             * - reservedMb=500
+             * - minFreeAfterLaunchMb=2000
+             * - maxMemoryPercent=80
+             *
+             * 后续你可以按压测结果继续调整。
+             */
+            reservedMb: 500,
+            minFreeAfterLaunchMb: 2000,
+            maxMemoryPercent: 80.0,
+            reservationStaleMs: 10 * 60 * 1000,
+            sampleCount: 5,
+            sampleIntervalMs: 500,
+            retryIntervalMs: 2000,
+        });
+    }
+
+    /**
+     * 用资源门禁包裹真正的高开销生成动作。
+     *
+     * 设计目标：
+     * - 让 generatePoToken 的主流程更清晰
+     * - 避免把资源门禁的细节散落在 generatePoToken 里
+     */
+    private async runWithResourceGate<T>(fn: () => Promise<T>): Promise<T> {
+        return await this.resourceGate.runExclusiveWithPermission(
+            {
+                debug: (msg) => this.logger.debug(msg),
+                warn: (msg) => this.logger.warn(msg),
+            },
+            fn,
+        );
+    }
+
+    /**
+     * 使缓存失效。
+     *
+     * 当前行为：
+     * - 清空当前进程内的 youtubeSessionDataCaches
+     * - 清空当前进程内的 _minterCache
+     *
+     * 注意：
+     * - 这里不清理磁盘缓存
+     * - 磁盘缓存若也要清理，应由外层单独提供接口处理
+     */
     public invalidateCaches() {
-        this.setYoutubeSessionDataCaches();
+        this.youtubeSessionDataCaches = {};
         this._minterCache.clear();
     }
 
+    /**
+     * 仅让当前进程内的 minter 失效。
+     *
+     * 做法：
+     * - 将所有 minter 的 expiry 设为 1970
+     *
+     * 说明：
+     * - 这样下次命中 _minterCache 时，会自动触发 regenerate
+     */
     public invalidateIT() {
         this._minterCache.forEach((minterCache) => {
             minterCache.expiry = new Date(0);
         });
     }
 
+    /**
+     * 清理当前进程内已经过期的 sessionData 缓存。
+     *
+     * 注意：
+     * - 这里只清理内存缓存
+     * - 磁盘缓存过期清理由 cache_store.ts 在读取时处理
+     */
     public cleanupCaches() {
-        for (const contentBinding in this.youtubeSessionDataCaches) {
+        for (const contentBinding of Object.keys(this.youtubeSessionDataCaches)) {
             const sessionData = this.youtubeSessionDataCaches[contentBinding];
-            if (sessionData && new Date() > sessionData.expiresAt)
+            if (!sessionData) {
+                continue;
+            }
+            if (new Date() > sessionData.expiresAt) {
                 delete this.youtubeSessionDataCaches[contentBinding];
+            }
         }
     }
 
-    public getYoutubeSessionDataCaches(cleanup = false) {
-        if (cleanup) this.cleanupCaches();
-        return this.youtubeSessionDataCaches;
-    }
-
-    public setYoutubeSessionDataCaches(
-        youtubeSessionData?: YoutubeSessionDataCaches,
-    ) {
-        this.youtubeSessionDataCaches = youtubeSessionData;
-    }
-
+    /**
+     * 获取当前进程内的 minterCache。
+     */
     public get minterCache(): MinterCache {
         return this._minterCache;
     }
 
+    /**
+     * 获取并解扰 BotGuard challenge。
+     *
+     * challenge 来源有两种：
+     * 1. 若调用方已传 challenge，则直接使用
+     * 2. 否则通过 /att/get 获取
+     * 3. 然后下载 interpreter JS，组装为 DescrambledChallenge
+     */
     private async getDescrambledChallenge(
         bgConfig: BgConfig,
         challenge?: ChallengeData,
@@ -238,6 +523,7 @@ export class SessionManager {
         try {
             if (!challenge) {
                 this.logger.debug("Using challenge from /att/get");
+
                 const attGetResponse = await bgConfig.fetch(
                     "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false",
                     {
@@ -257,20 +543,26 @@ export class SessionManager {
                         }),
                     },
                 );
+
                 const attestation = await attGetResponse.json();
-                if (!attestation)
+                if (!attestation) {
                     throw new Error("Failed to get challenge from /att/get");
+                }
+
                 challenge = attestation.bgChallenge as ChallengeData;
             } else {
                 this.logger.debug("Using challenge from the webpage");
             }
+
             const { program, globalName, interpreterHash } = challenge;
             const { privateDoNotAccessOrElseTrustedResourceUrlWrappedValue } =
                 challenge.interpreterUrl;
+
             const interpreterJSResponse = await bgConfig.fetch(
                 `https:${privateDoNotAccessOrElseTrustedResourceUrlWrappedValue}`,
             );
             const interpreterJS = await interpreterJSResponse.text();
+
             return {
                 program,
                 globalName,
@@ -286,6 +578,13 @@ export class SessionManager {
         }
     }
 
+    /**
+     * 生成 TokenMinter，并写入当前进程内 _minterCache。
+     *
+     * 说明：
+     * - 这是“进程内 minter 缓存”层
+     * - 与磁盘层的“最终 POT 缓存”不是一回事
+     */
     private async generateTokenMinter(
         cacheSpec: CacheSpec,
         bgConfig: BgConfig,
@@ -305,7 +604,9 @@ export class SessionManager {
 
         if (interpreterJavascript) {
             new Function(interpreterJavascript)();
-        } else throw new Error("Could not load VM");
+        } else {
+            throw new Error("Could not load VM");
+        }
 
         let bgClient: BG.BotGuardClient;
         try {
@@ -315,13 +616,15 @@ export class SessionManager {
                 globalObj: bgConfig.globalObj,
             });
         } catch (e) {
-            throw new Error(`Failed to create BG client.`, { cause: e });
+            throw new Error("Failed to create BG client.", { cause: e });
         }
+
         try {
             const webPoSignalOutput: WebPoSignalOutput = [];
             const botguardResponse = await bgClient.snapshot({
                 webPoSignalOutput,
             });
+
             const integrityTokenResp = await bgConfig.fetch(
                 buildURL("GenerateIT"),
                 {
@@ -353,10 +656,12 @@ export class SessionManager {
                 websafeFallbackToken,
             };
 
-            if (!integrityToken)
+            if (!integrityToken) {
                 throw new Error(
                     `Unexpected empty integrity token, response: ${JSON.stringify(integrityTokenData)}`,
                 );
+            }
+
             this.logger.debug(
                 `Generated IntegrityToken: ${JSON.stringify(integrityTokenData)}`,
             );
@@ -369,58 +674,103 @@ export class SessionManager {
                     webPoSignalOutput,
                 ),
             };
+
             this._minterCache.set(cacheSpec.key, tokenMinter);
             return tokenMinter;
         } catch (e) {
-            throw new Error(`Failed to generate an integrity token.`, {
+            throw new Error("Failed to generate an integrity token.", {
                 cause: e,
             });
         }
     }
 
+    /**
+     * 使用已有 tokenMinter 为某个 contentBinding mint POT。
+     *
+     * 说明：
+     * - 这是“真正 mint 最终 POT”的最后一步
+     * - 成功后会同步写回当前进程内 youtubeSessionDataCaches
+     * - 磁盘缓存的写回由 generatePoToken 外层统一处理
+     */
     private async tryMintPOT(
         contentBinding: string,
         tokenMinter: TokenMinter,
     ): Promise<YoutubeSessionData> {
         this.logger.log(`Generating POT for ${contentBinding}`);
+
         try {
             const poToken =
                 await tokenMinter.minter.mintAsWebsafeString(contentBinding);
-            if (poToken) {
-                this.logger.log(`poToken: ${poToken}`);
-                const youtubeSessionData: YoutubeSessionData = {
-                    contentBinding,
-                    poToken,
-                    expiresAt: new Date(
-                        Date.now() + this.TOKEN_TTL_HOURS * 60 * 60 * 1000,
-                    ),
-                };
-                if (this.youtubeSessionDataCaches)
-                    this.youtubeSessionDataCaches[contentBinding] =
-                        youtubeSessionData;
-                return youtubeSessionData;
-            } else throw new Error("Unexpected empty POT");
-        } catch (e) {
+
+            if (!poToken) {
+                throw new Error("Unexpected empty POT");
+            }
+
+            this.logger.log(`poToken: ${poToken}`);
+
+            const youtubeSessionData = buildYoutubeSessionData(
+                contentBinding,
+                poToken,
+                this.TOKEN_TTL_HOURS,
+            );
+
+            /**
+             * 成功生成后，同时更新当前进程内缓存。
+             *
+             * 注意：
+             * - 磁盘缓存写回不在这里做
+             * - 磁盘缓存统一由 generatePoToken 主流程在持锁状态下写回
+             */
+            this.youtubeSessionDataCaches[contentBinding] = youtubeSessionData;
+
+            return youtubeSessionData;
+        } catch (e: any) {
             throw new Error(
-                `Failed to mint POT for ${contentBinding}: ${e.message}`,
+                `Failed to mint POT for ${contentBinding}: ${e?.message}`,
                 { cause: e },
             );
         }
     }
 
+    /**
+     * 判断当前是否运行在 Deno 环境。
+     */
     private _isDenoRuntime(): boolean {
         return typeof (globalThis as any).Deno !== "undefined";
     }
 
+    /**
+     * 构造 Deno 下使用的 HttpClient。
+     *
+     * 说明：
+     * - Deno 的 proxy 直接接受 url 字符串
+     * - 当前未在这里进一步处理“跳过 TLS 校验”，以避免引入更多不确定性
+     */
     private _getDenoHttpClient(proxySpec: ProxySpec, logger: Logger): any {
         const DenoNS = (globalThis as any).Deno;
         if (!DenoNS?.createHttpClient) {
-            throw new Error("Deno.createHttpClient is not available in this runtime");
+            throw new Error(
+                "Deno.createHttpClient is not available in this runtime",
+            );
+        }
+
+        // 这里模仿 asDispatcher，也打印一次代理信息
+        const proxyUrl = proxySpec.proxy;
+        if (proxyUrl) {
+            try {
+                const parsed = new URL(proxyUrl);
+                const loggedProxy = parsed.password
+                    ? proxyUrl.replace(parsed.password, "****")
+                    : proxyUrl;
+                logger.log(`Using proxy: ${loggedProxy}`);
+            } catch {
+                logger.log(`Using proxy: ${proxyUrl}`);
+            }
         }
 
         // Deno 的 proxy 直接用 string（http://user:pass@host:port）
         return DenoNS.createHttpClient({
-            proxy: {url: proxySpec.proxy},
+            proxy: proxySpec.proxy ? { url: proxySpec.proxy } : undefined,
             // 语义对齐：disableTlsVerification=true => 不校验证书
             // Deno 里是 `caCerts` / `cert` / `key` 之类更细项；最简单做法：
             // 如果你需要“跳过证书校验”，建议在代理侧保证证书正确，或者只用于 https proxy。
@@ -428,6 +778,14 @@ export class SessionManager {
         });
     }
 
+    /**
+     * 对 headers 做规范化：
+     * - 支持普通对象 / Headers
+     * - key 统一转小写
+     * - 同名 key 后写覆盖前写
+     *
+     * 主要用于修复 Deno fetch 下大小写不同但语义相同的 header 冲突问题。
+     */
     private normalizeHeaders(input: any): Headers {
         const h = new Headers();
 
@@ -451,18 +809,33 @@ export class SessionManager {
         for (const [k, v] of m.entries()) {
             h.set(k, v);
         }
+
         return h;
     }
 
+    /**
+     * 将 options.params 追加到 URL 上。
+     *
+     * 说明：
+     * - 支持 string / URL 输入
+     * - 支持 params 为对象 / query string
+     * - 支持数组值展开
+     */
     private applyParamsToUrl(inputUrl: any, params: any): string {
         // params 为空直接返回原 url
-        if (!params || (typeof params === "object" && Object.keys(params).length === 0)) {
+        if (
+            !params ||
+            (typeof params === "object" && Object.keys(params).length === 0)
+        ) {
             return String(inputUrl);
         }
 
         // 把 inputUrl 变成可操作的 URL（支持 string / URL）
         // 注意：如果 inputUrl 可能是相对路径，需要给 base；你这里基本都是 https://...，所以够用
-        const u = inputUrl instanceof URL ? new URL(inputUrl.toString()) : new URL(String(inputUrl));
+        const u =
+            inputUrl instanceof URL
+                ? new URL(inputUrl.toString())
+                : new URL(String(inputUrl));
 
         const appendOne = (k: string, v: any) => {
             if (v === undefined || v === null) return;
@@ -474,13 +847,17 @@ export class SessionManager {
         };
 
         if (typeof params === "object") {
-            for (const [k, v] of Object.entries(params)) appendOne(k, v);
+            for (const [k, v] of Object.entries(params)) {
+                appendOne(k, v);
+            }
         } else {
             // 兜底：如果 params 不是对象（不太可能），直接当字符串拼进去
             // 例如 params="a=1&b=2"
             const s = String(params);
             if (s) {
-                const sp = new URLSearchParams(s.startsWith("?") ? s.slice(1) : s);
+                const sp = new URLSearchParams(
+                    s.startsWith("?") ? s.slice(1) : s,
+                );
                 sp.forEach((v, k) => u.searchParams.append(k, v));
             }
         }
@@ -488,20 +865,37 @@ export class SessionManager {
         return u.toString();
     }
 
+    /**
+     * 构造统一 fetch。
+     *
+     * 说明：
+     * - Deno 路径：原生 fetch + createHttpClient
+     * - Node 路径：axios + httpsAgent / ProxyAgent
+     * - 带重试机制
+     */
     private getFetch(
         proxySpec: ProxySpec,
         maxRetries: number,
         intervalMs: number,
     ): FetchFunction {
         const { logger } = this;
+
         return async (url: any, options: any): Promise<any> => {
             const method = (options?.method || "GET").toUpperCase();
+
             for (let attempts = 1; attempts <= maxRetries; attempts++) {
                 try {
                     // ====== Deno 路径：createHttpClient + 原生 fetch ======
                     if (this._isDenoRuntime()) {
-                        const client = this._getDenoHttpClient(proxySpec, logger);
-                        const finalUrl = this.applyParamsToUrl(url, options?.params);
+                        const client = this._getDenoHttpClient(
+                            proxySpec,
+                            logger,
+                        );
+                        const finalUrl = this.applyParamsToUrl(
+                            url,
+                            options?.params,
+                        );
+
                         // 由于 deno 的 fetch 请求，针对 header 中 重复且大小写不同的 Content-Type 参数，无法正常覆盖，导致最终请求失败
                         // 从代码层面分析：
                         // 外层调用时，对应 getHeaders() 里本来就带了 "content-type":"application/json+protobuf"，然后又配置 "Content-Type": "application/json"
@@ -515,9 +909,10 @@ export class SessionManager {
                         // • Deno(fetch) 直接传了普通对象，可能会把 content-type 和 Content-Type 当成两条 header 发出去，服务端挑了 protobuf 那个，于是报 “不接受 top-level braces”。
                         // 这里通过 normalizeHeaders 方法，将 header 中的参数进行 小写 + 去重
                         const headers = this.normalizeHeaders(options?.headers);
+
                         const resp = await fetch(finalUrl, {
                             method,
-                            headers: headers,
+                            headers,
                             body: options?.body,
                             // Deno 扩展：把 client 传给 fetch
                             client,
@@ -532,9 +927,11 @@ export class SessionManager {
                         params: options?.params,
                         httpsAgent: proxySpec.asDispatcher(logger),
                     };
-                    const response = await (method === "GET"
-                        ? axios.get(url, axiosOpt)
-                        : axios.post(url, options?.body, axiosOpt));
+
+                    const response =
+                        method === "GET"
+                            ? await axios.get(url, axiosOpt)
+                            : await axios.post(url, options?.body, axiosOpt);
 
                     return {
                         ok: response.status >= 200 && response.status < 300,
@@ -546,20 +943,95 @@ export class SessionManager {
                                 : JSON.stringify(response.data),
                     };
                 } catch (e) {
-                    if (attempts >= maxRetries)
+                    if (attempts >= maxRetries) {
                         throw new Error(
                             `Error reaching ${method} ${url}: All ${attempts} retries failed.`,
                             { cause: e },
                         );
+                    }
                     await new Promise((resolve) =>
                         setTimeout(resolve, intervalMs),
                     );
                 }
             }
+
+            throw new Error(
+                `Error reaching ${method} ${url}: unexpected retry loop exit.`,
+            );
         };
     }
 
-    // 注意：当前方法是对 generatePoToken 的日志完善，并不修改原有代码逻辑
+    /**
+     * 统一生成一次调用的 traceId，方便日志 grep / 对比。
+     */
+    private buildTraceId(): string {
+        return `pot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    /**
+     * 安全 stringify：避免循环引用导致日志打印崩掉。
+     */
+    private safeStringify(v: any): string {
+        try {
+            return JSON.stringify(v);
+        } catch {
+            return `[Unserializable:${typeof v}]`;
+        }
+    }
+
+    /**
+     * 对大字段做摘要，便于日志查看。
+     *
+     * 常见大字段：
+     * - challenge
+     * - innertubeContext
+     */
+    private summarizeForLog(v: any, limit = 500) {
+        if (v === undefined) return { type: "undefined" };
+        if (v === null) return { type: "null" };
+
+        const t = typeof v;
+        if (t === "string") {
+            const s = v as string;
+            return {
+                type: "string",
+                length: s.length,
+                preview:
+                    s.length > limit
+                        ? `${s.slice(0, limit)} ...<truncated>`
+                        : s,
+            };
+        }
+
+        const s = this.safeStringify(v);
+        return {
+            type: Array.isArray(v) ? "array" : t,
+            jsonLength: s.length,
+            preview:
+                s.length > limit ? `${s.slice(0, limit)} ...<truncated>` : s,
+        };
+    }
+
+    /**
+     * 生成或读取一个 POT。
+     *
+     * 当前整体流程：
+     *
+     * 1. 参数整理
+     * 2. 清理当前进程内过期缓存
+     * 3. 构建 ProxySpec / CacheSpec / BgConfig
+     * 4. 解析最终 contentBinding
+     * 5. 基于最终 contentBinding 获取“单 key 锁”
+     * 6. 锁内优先查磁盘缓存（跨进程共享）
+     * 7. 磁盘缓存 miss 后，再查当前进程内缓存：
+     *    - youtubeSessionDataCaches
+     *    - _minterCache
+     * 8. 进入资源门禁
+     * 9. 仍 miss 时，再真正生成 minter 与 poToken
+     * 10. 成功后写回磁盘缓存
+     *
+     * 这样 script / http 两条链路最终都统一复用这一个入口。
+     */
     async generatePoToken(
         contentBinding: string | undefined,
         proxy: string = "",
@@ -569,46 +1041,7 @@ export class SessionManager {
         challenge: ChallengeData | undefined = undefined,
         innertubeContext?: InnertubeContext,
     ): Promise<YoutubeSessionData> {
-        // 生成一次调用的 traceId，方便 grep / 对比（不要求全局唯一，但足够区分）
-        const traceId =
-            `pot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-
-        // 安全 stringify：避免循环引用导致 console 崩
-        const safeStringify = (v: any): string => {
-            try {
-                return JSON.stringify(v);
-            } catch {
-                return `[Unserializable:${typeof v}]`;
-            }
-        };
-
-        /**
-         * 对大字段做摘要（challenge/innertubeContext 常常特别大）
-         * - type: string/object/array/undefined/null
-         * - jsonLength: JSON 字符串长度（用于快速对比是否“同一份内容”）
-         * - preview: 截断预览（默认 500 字符）
-         */
-        const summarize = (v: any, limit = 500) => {
-            if (v === undefined) return {type: "undefined"};
-            if (v === null) return {type: "null"};
-
-            const t = typeof v;
-            if (t === "string") {
-                const s = v as string;
-                return {
-                    type: "string",
-                    length: s.length,
-                    preview: s.length > limit ? s.slice(0, limit) + " ...<truncated>" : s,
-                };
-            }
-
-            const s = safeStringify(v);
-            return {
-                type: Array.isArray(v) ? "array" : t, // object/array/number/boolean
-                jsonLength: s.length,
-                preview: s.length > limit ? s.slice(0, limit) + " ...<truncated>" : s,
-            };
-        };
+        const traceId = this.buildTraceId();
 
         /**
          * =========================
@@ -616,46 +1049,54 @@ export class SessionManager {
          * =========================
          * 注意：
          * - 这里打印的是“调用方传入的原始值”
-         * - proxy 为空字符串时，你后面会 fallback 到环境变量，因此这里要把 env 候选一起打印
+         * - proxy 为空字符串时，后面会 fallback 到环境变量，因此这里要把 env 候选一起打印
          */
         const envProxy =
-            process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY || "";
+            process.env.HTTPS_PROXY ||
+            process.env.HTTP_PROXY ||
+            process.env.ALL_PROXY ||
+            "";
 
         this.logger.log(
             `[${traceId}] generatePoToken:enter ` +
-            safeStringify({
-                content_binding: contentBinding ?? "",
-                proxy_arg: proxy ?? "",
-                proxy_env_candidate: envProxy,
-                bypass_cache: !!bypassCache,
-                source_address: sourceAddress ?? "",
-                disable_tls_verification: !!disableTlsVerification,
-                challenge: summarize(challenge),
-                innertube_context: summarize(innertubeContext),
-            }),
+                this.safeStringify({
+                    content_binding: contentBinding ?? "",
+                    proxy_arg: proxy ?? "",
+                    proxy_env_candidate: envProxy,
+                    bypass_cache: !!bypassCache,
+                    source_address: sourceAddress ?? "",
+                    disable_tls_verification: !!disableTlsVerification,
+                    challenge: this.summarizeForLog(challenge),
+                    innertube_context: this.summarizeForLog(innertubeContext),
+                }),
         );
 
         /**
          * =========================
-         * 清理缓存
+         * 清理当前进程内过期缓存
          * =========================
+         *
+         * 注意：
+         * - 这里只清理进程内 youtubeSessionDataCaches
+         * - 不清理磁盘缓存
          */
         this.cleanupCaches();
 
         /**
          * =========================
-         * ProxySpec 构建 & 最终 proxy 选择
+         * ProxySpec 构建 & 最终代理选择
          * =========================
          */
         const pxySpec = new ProxySpec({
             sourceAddress,
             disableTlsVerification,
         });
+
         if (proxy) {
             pxySpec.proxy = proxy;
             this.logger.log(
                 `[${traceId}] generatePoToken:proxy_selected from_arg ` +
-                safeStringify({proxy_selected: pxySpec.proxy}),
+                    this.safeStringify({ proxy_selected: pxySpec.proxy }),
             );
         } else {
             pxySpec.proxy =
@@ -665,38 +1106,24 @@ export class SessionManager {
 
             this.logger.log(
                 `[${traceId}] generatePoToken:proxy_selected from_env ` +
-                safeStringify({proxy_selected: pxySpec.proxy ?? ""}),
+                    this.safeStringify({
+                        proxy_selected: pxySpec.proxy ?? "",
+                    }),
             );
         }
 
         /**
          * =========================
-         * CacheSpec 构建（也会影响 key / 缓存命中）
+         * BgConfig / contentBinding 解析
          * =========================
+         *
          * 注意：
-         * - cacheSpec 的 key 如果不同，会导致一边走缓存/复用 minter，另一边重新生成
-         * - remoteHost 缺失/不同也会影响 key
-         */
-        const cacheSpec = new CacheSpec(
-            pxySpec,
-            innertubeContext?.client.remoteHost || null,
-        );
-
-        this.logger.log(
-            `[${traceId}] generatePoToken:cacheSpec ` +
-            safeStringify({
-                remoteHost: innertubeContext?.client.remoteHost || null,
-                cacheKey: (cacheSpec as any)?.key ?? "<no_key_field>",
-            }),
-        );
-
-        /**
-         * =========================
-         * BgConfig
-         * =========================
+         * - 单 key 锁必须建立在“最终 contentBinding 已知”的前提下
+         * - 因此这里先把 contentBinding 解析完整
          */
         const bgFetch = this.getFetch(pxySpec, 3, 5000);
         let innertube: Innertube | undefined = undefined;
+
         if (!contentBinding && innertubeContext) {
             this.logger.warn(
                 "No content binding provided, using the one from the supplied Innertube context...",
@@ -715,129 +1142,244 @@ export class SessionManager {
             contentBinding = innertube.session.context.client.visitorData;
         }
 
-        if (!contentBinding) throw new Error("Unable to generate visitor data");
+        if (!contentBinding) {
+            throw new Error("Unable to generate visitor data");
+        }
 
-        if (!innertubeContext) innertubeContext = innertube?.session.context;
+        if (!innertubeContext) {
+            innertubeContext = innertube?.session.context;
+        }
+
+        /**
+         * 走到这里时，最终的 contentBinding 已经确定。
+         *
+         * 后续所有：
+         * - 单 key 锁
+         * - 磁盘缓存
+         * - 进程内缓存
+         * - 真正生成
+         *
+         * 都统一基于这个 resolvedContentBinding 进行。
+         */
+        const resolvedContentBinding = contentBinding;
+
+        /**
+         * =========================
+         * CacheSpec 构建
+         * =========================
+         *
+         * 说明：
+         * - 这是 minterCache 的 key 维度
+         * - 与磁盘 POT 缓存按 contentBinding 存，不是同一层级
+         */
+        const cacheSpec = new CacheSpec(
+            pxySpec,
+            innertubeContext?.client.remoteHost || null,
+        );
+
+        this.logger.log(
+            `[${traceId}] generatePoToken:cacheSpec ` +
+                this.safeStringify({
+                    remoteHost: innertubeContext?.client.remoteHost || null,
+                    cacheKey: cacheSpec.key,
+                    cachedir: this.cachedir,
+                }),
+        );
 
         const bgConfig: BgConfig = {
             fetch: bgFetch,
             globalObj: globalThis,
-            identifier: contentBinding,
+            identifier: resolvedContentBinding,
             requestKey: SessionManager.REQUEST_KEY,
         };
 
         this.logger.log(
             `[${traceId}] generatePoToken:bgConfig_ready ` +
-            safeStringify({
-                identifier: bgConfig.identifier,
-                requestKey: bgConfig.requestKey,
-            }),
+                this.safeStringify({
+                    identifier: bgConfig.identifier,
+                    requestKey: bgConfig.requestKey,
+                }),
         );
 
         /**
          * =========================
-         * 缓存分支
+         * 单 key 锁：以 resolvedContentBinding 为粒度
          * =========================
+         *
+         * 设计目标：
+         * - 相同 contentBinding 串行，避免并发重复 mint
+         * - 不同 contentBinding 并发，不互相阻塞
+         *
+         * 这样可以避免同一个 key 在多进程/多并发下重复 mint。
          */
-        if (!bypassCache) {
-            // 1) JSON cache（youtubeSessionDataCaches）
-            if (this.youtubeSessionDataCaches) {
-                const sessionData =
-                    this.youtubeSessionDataCaches[contentBinding];
-                if (sessionData) {
+        const contentBindingLock: CacheEntryLock = getCacheEntryLock(
+            this.cachedir,
+            resolvedContentBinding,
+        );
+
+        return await contentBindingLock.runExclusive(async () => {
+            /**
+             * ================================================================
+             * Step 1. 先查单 key 磁盘缓存（跨进程共享）
+             * ================================================================
+             *
+             * 优先级最高。
+             * 原因：
+             * - 磁盘缓存可以跨进程共享
+             * - 多个 script / 多个 HTTP 请求 / 多个子进程都能复用
+             *
+             * 这里必须放在单 key 锁里读，才能确保：
+             * - 同 key 并发请求不会重复 mint
+             * - 后来的请求能读到前一个请求刚写回的结果
+             */
+            if (!bypassCache) {
+                const diskCached = getYoutubeSessionDataLocked(
+                    this.cachedir,
+                    resolvedContentBinding,
+                    true,
+                );
+
+                if (diskCached) {
                     this.logger.log(
-                        `[${traceId}] generatePoToken:hit_youtubeSessionDataCaches -> return_cached_token`,
+                        `[${traceId}] generatePoToken:hit_disk_cache -> return_cached_token`,
                     );
 
-                    this.logger.log(
-                        `POT for ${contentBinding} still fresh, returning cached token`,
-                    );
-                    return sessionData;
+                    /**
+                     * 命中磁盘缓存后，顺手把结果同步回当前进程内缓存。
+                     *
+                     * 好处：
+                     * - 当前进程后续再访问同一个 contentBinding 时，
+                     *   即使磁盘缓存层 miss / 未查到，也还能继续享受进程内缓存命中。
+                     */
+                    this.youtubeSessionDataCaches[resolvedContentBinding] =
+                        diskCached;
+
+                    return diskCached;
                 } else {
                     this.logger.log(
-                        `[${traceId}] generatePoToken:miss_youtubeSessionDataCaches`,
+                        `[${traceId}] generatePoToken:miss_disk_cache`,
                     );
                 }
             } else {
                 this.logger.log(
-                    `[${traceId}] generatePoToken:youtubeSessionDataCaches_absent`,
+                    `[${traceId}] generatePoToken:bypassCache=true -> skip_disk_cache`,
                 );
             }
 
-            // 2) _minterCache（按 cacheSpec.key）
-            let tokenMinter = this._minterCache.get(cacheSpec.key);
-            if (tokenMinter) {
-                this.logger.log(
-                    `[${traceId}] generatePoToken:hit_minterCache ` +
-                    safeStringify({
-                        minter_expiry: (tokenMinter as any)?.expiry
-                            ? String((tokenMinter as any).expiry)
-                            : "<no_expiry>",
-                    }),
-                );
+            /**
+             * ================================================================
+             * Step 2. 再查当前进程内 sessionData 缓存
+             * ================================================================
+             *
+             * 磁盘缓存 miss 后，再看当前进程内缓存：
+             * 1. youtubeSessionDataCaches
+             * 2. _minterCache
+             */
+            if (!bypassCache) {
+                const memoryCached =
+                    this.youtubeSessionDataCaches[resolvedContentBinding];
 
-                // Replace minter if expired
-                if (new Date() >= tokenMinter.expiry) {
+                if (memoryCached && new Date() <= memoryCached.expiresAt) {
                     this.logger.log(
-                        `[${traceId}] generatePoToken:minter_expired -> regenerate_tokenMinter`,
+                        `[${traceId}] generatePoToken:hit_memory_session_cache -> return_cached_token`,
+                    );
+                    return memoryCached;
+                } else {
+                    this.logger.log(
+                        `[${traceId}] generatePoToken:miss_memory_session_cache`,
+                    );
+                }
+            }
+
+            /**
+             * ================================================================
+             * Step 3. 进入真正高开销生成路径前，统一走资源门禁
+             * ================================================================
+             *
+             * 说明：
+             * - 只有在缓存 miss 时，才需要资源门禁
+             * - 这样缓存命中不会被无意义排队
+             */
+            return await this.runWithResourceGate(async () => {
+                /**
+                 * ============================================================
+                 * Step 4. 再看当前进程内 minterCache
+                 * ============================================================
+                 *
+                 * 这里放在资源门禁内，而不是外面，原因是：
+                 * - 即使 minterCache 命中，后续 tryMintPOT 仍属于高开销步骤
+                 * - 因此把“minter 判定 + refresh + mint”整体放进同一段门禁更直观
+                 */
+                let tokenMinter = this._minterCache.get(cacheSpec.key);
+
+                if (tokenMinter) {
+                    this.logger.log(
+                        `[${traceId}] generatePoToken:hit_minterCache ` +
+                            this.safeStringify({
+                                minter_expiry: String(tokenMinter.expiry),
+                            }),
                     );
 
-                    this.logger.log("POT minter expired, getting a new one");
+                    if (new Date() >= tokenMinter.expiry) {
+                        this.logger.log(
+                            `[${traceId}] generatePoToken:minter_expired -> regenerate_tokenMinter`,
+                        );
+
+                        tokenMinter = await this.generateTokenMinter(
+                            cacheSpec,
+                            bgConfig,
+                            challenge,
+                            innertubeContext,
+                        );
+                    } else {
+                        this.logger.log(
+                            `[${traceId}] generatePoToken:minter_fresh -> reuse_tokenMinter`,
+                        );
+                    }
+                } else {
+                    this.logger.log(
+                        `[${traceId}] generatePoToken:miss_minterCache -> generate_tokenMinter`,
+                    );
+
                     tokenMinter = await this.generateTokenMinter(
                         cacheSpec,
                         bgConfig,
                         challenge,
                         innertubeContext,
                     );
-                } else {
-                    this.logger.log(
-                        `[${traceId}] generatePoToken:minter_fresh -> reuse_tokenMinter`,
-                    );
                 }
 
-                this.logger.log(
-                    `[${traceId}] generatePoToken:tryMintPOT(using_cached_or_refreshed_minter)`,
+                /**
+                 * ============================================================
+                 * Step 5. 真正 mint POT
+                 * ============================================================
+                 */
+                this.logger.log(`[${traceId}] generatePoToken:tryMintPOT`);
+
+                const result = await this.tryMintPOT(
+                    resolvedContentBinding,
+                    tokenMinter,
                 );
-                return await this.tryMintPOT(contentBinding, tokenMinter);
-            } else {
-                this.logger.log(`[${traceId}] generatePoToken:miss_minterCache`);
-            }
-        } else {
-            this.logger.log(`[${traceId}] generatePoToken:bypassCache=true`);
-        }
 
-        /**
-         * =========================
-         * 走到这里：一定会生成新的 tokenMinter
-         * =========================
-         */
-        this.logger.log(
-            `[${traceId}] generatePoToken:generateTokenMinter ` +
-            safeStringify({
-                challenge: summarize(challenge), // 再打一次摘要，确认进入 minter 时的 challenge 状态
-                innertube_context: summarize(innertubeContext),
-            }),
-        );
+                /**
+                 * ============================================================
+                 * Step 6. 在同一把单 key 锁内写回磁盘缓存
+                 * ============================================================
+                 *
+                 * 这样可以避免多个同 key 并发时互相覆盖。
+                 */
+                setYoutubeSessionDataLocked(this.cachedir, result);
 
-        const tokenMinter = await this.generateTokenMinter(
-            cacheSpec,
-            bgConfig,
-            challenge,
-            innertubeContext,
-        );
+                this.logger.log(
+                    `[${traceId}] generatePoToken:done ` +
+                        this.safeStringify({
+                            poToken: result.poToken,
+                            expiresAt: String(result.expiresAt),
+                        }),
+                );
 
-        this.logger.log(`[${traceId}] generatePoToken:tryMintPOT(new_minter)`);
-
-        const result = await this.tryMintPOT(contentBinding, tokenMinter);
-
-        this.logger.log(
-            `[${traceId}] generatePoToken:done ` +
-            safeStringify({
-                poToken: (result as any)?.poToken ? (result as any).poToken : "",
-                expiresAt: (result as any)?.expiresAt ? String((result as any).expiresAt) : "",
-            }),
-        );
-
-        return result;
+                return result;
+            });
+        });
     }
 }

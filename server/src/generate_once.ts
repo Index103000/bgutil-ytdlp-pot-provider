@@ -1,8 +1,6 @@
-import { SessionManager, YoutubeSessionDataCaches } from "./session_manager.ts";
+import { SessionManager } from "./session_manager.ts";
 import { VERSION } from "./utils.ts";
 import { Command } from "commander";
-import * as fs from "node:fs";
-import * as path from "node:path";
 
 /**
  * =========================
@@ -12,10 +10,13 @@ import * as path from "node:path";
 
 /**
  * 读取 stdin 全部内容（UTF-8），用于承载大 JSON payload。
- * 这样可以绕过 Windows CreateProcess 206（命令行过长）限制。
+ *
+ * 设计原因：
+ * - 这样可以绕过 Windows CreateProcess 206（命令行过长）限制；
+ * - 也能让 script 模式与 http 模式在入参结构上尽量保持一致。
  *
  * 注意：
- * - 当由 Python provider 通过 stdin 喂数据时，stdin 会被自动关闭，因此这里会正常返回。
+ * - 当由 Python provider 通过 stdin 喂数据时，stdin 会被自动关闭，因此这里会正常返回；
  * - 如果你手动执行 `node xxx.js --stdin-json`，需要确保管道最终结束（EOF），否则会一直等待。
  */
 async function readAllStdin(): Promise<string> {
@@ -41,11 +42,15 @@ function safeJsonParse<T = any>(s?: string): T | undefined {
 }
 
 /**
- * 把 CLI 的 challenge 字符串转换成对象：
- * - 如果是 JSON 字符串，优先 JSON.parse
- * - 如果是纯字符串（未来可能出现），可以按需包装
+ * 把 CLI 的 challenge 字符串转换成对象。
  *
- * 当前正常情况下：Python 侧会传 challenge 对象（JSON），因此这里基本就是 JSON.parse。
+ * 逻辑：
+ * - 如果是 JSON 字符串，优先 JSON.parse
+ * - 如果不是合法 JSON，则返回 undefined
+ *
+ * 说明：
+ * - 当前正常情况下，Python 侧传入的是 challenge 对象（JSON），
+ *   因此这里本质上就是做一层安全 parse。
  */
 function normalizeChallengeFromCli(ch?: string): any | undefined {
     if (!ch) return undefined;
@@ -80,29 +85,6 @@ type StdinPayload = {
     source_address?: string;
 };
 
-// Follow XDG Base Directory Specification: https://specifications.freedesktop.org/basedir-spec/latest/
-let cachedir;
-const homeDirectory = process.env.HOME || process.env.USERPROFILE;
-const { XDG_CACHE_HOME } = process.env;
-if (XDG_CACHE_HOME !== undefined) {
-    cachedir = path.resolve(XDG_CACHE_HOME, "bgutil-ytdlp-pot-provider");
-} else if (homeDirectory) {
-    cachedir = path.resolve(
-        homeDirectory,
-        ".cache",
-        "bgutil-ytdlp-pot-provider",
-    );
-} else {
-    // fall back to a known path if environment variables are not found
-    cachedir = path.resolve(import.meta.dirname, "..");
-}
-if (!fs.existsSync(cachedir)) {
-    fs.mkdir(cachedir, { recursive: true }, (err) => {
-        if (err) throw err;
-    });
-}
-const CACHE_PATH = path.resolve(cachedir, "cache.json");
-
 const program = new Command()
     .option("-c, --content-binding <content-binding>")
     .option("-v, --visitor-data <visitordata>") // to be removed in a future version
@@ -115,17 +97,23 @@ const program = new Command()
     .option("--version")
     .option("--verbose")
 
-    // ===== 兼容 CLI 模式=====
-    .option("--challenge <challenge>", "Challenge JSON string (legacy CLI mode)")
+    // ===== 兼容 CLI 模式 =====
+    .option(
+        "--challenge <challenge>",
+        "Challenge JSON string (legacy CLI mode)",
+    )
 
-    // ===== stdin-json 模式=====
-    .option("--stdin-json", "Read all options as JSON from stdin (recommended on Windows to avoid argv length limits)")
+    // ===== stdin-json 模式 =====
+    .option(
+        "--stdin-json",
+        "Read all options as JSON from stdin (recommended on Windows to avoid argv length limits)",
+    )
 
     .exitOverride();
 
 try {
     program.parse();
-} catch (err) {
+} catch (err: any) {
     if (err.code === "commander.unknownOption") {
         console.log();
         program.outputHelp();
@@ -139,12 +127,14 @@ const options = program.opts();
         console.log(VERSION);
         process.exit(0);
     }
+
     if (options.dataSyncId) {
         console.error(
             "Data sync id is deprecated, use --content-binding instead",
         );
         process.exit(1);
     }
+
     if (options.visitorData) {
         console.error(
             "Visitor data is deprecated, use --content-binding instead",
@@ -153,34 +143,18 @@ const options = program.opts();
     }
 
     const verbose = options.verbose || false;
-    const cache: YoutubeSessionDataCaches = {};
-    if (fs.existsSync(CACHE_PATH)) {
-        try {
-            const parsedCaches = JSON.parse(
-                fs.readFileSync(CACHE_PATH, "utf8"),
-            );
-            for (const contentBinding in parsedCaches) {
-                const parsedCache = parsedCaches[contentBinding];
-                if (parsedCache) {
-                    const expiresAt = new Date(parsedCache.expiresAt);
-                    if (!isNaN(expiresAt.getTime()))
-                        cache[contentBinding] = {
-                            poToken: parsedCache.poToken,
-                            expiresAt,
-                            contentBinding: contentBinding,
-                        };
-                    else
-                        console.warn(
-                            `Ignored cache entry: invalid expiresAt for content binding '${contentBinding}'.`,
-                        );
-                }
-            }
-        } catch (e) {
-            console.warn(`Error parsing cache. e = ${e}`);
-        }
-    }
 
-    const sessionManager = new SessionManager(verbose, cache || {});
+    /**
+     * SessionManager 现在已经内部统一处理：
+     * - 默认 cachedir 计算
+     * - 单 key 锁
+     * - 单 key 磁盘缓存
+     * - 当前进程内缓存
+     *
+     * 因此 generate_once.ts 不再自己读取 / 写入 cache.json，
+     * 也不再需要自己预加载 YoutubeSessionDataCaches。
+     */
+    const sessionManager = new SessionManager(verbose);
 
     /**
      * ==============
@@ -188,9 +162,10 @@ const options = program.opts();
      * ==============
      *
      * 注意 disable_tls_verification 的语义：
-     * - True  表示“禁用 TLS 校验”
-     * - False 表示“正常校验 TLS”
-     * 这一点要和 Python provider 的 payload 保持一致
+     * - true  表示“禁用 TLS 校验”
+     * - false 表示“正常校验 TLS”
+     *
+     * 这一点要与 Python provider 的 payload 保持一致。
      */
     let contentBinding: string | undefined = options.contentBinding;
     let proxy: string = options.proxy || "";
@@ -212,33 +187,35 @@ const options = program.opts();
             process.exit(1);
         }
 
-        // 覆盖基础字段（payload 优先级最高）
+        // payload 优先级最高
         contentBinding = payload.content_binding ?? contentBinding;
         proxy = payload.proxy ?? proxy;
         bypassCache = payload.bypass_cache ?? bypassCache;
         sourceAddress = payload.source_address ?? sourceAddress;
+        disableTlsVerification =
+            payload.disable_tls_verification ?? disableTlsVerification;
 
-        // payload.disable_tls_verification 语义：是否禁用 TLS 验证
-        disableTlsVerification = payload.disable_tls_verification ?? disableTlsVerification;
-
-        // 大对象字段
         challengeObj = payload.challenge;
         innertubeContextObj = payload.innertube_context;
-
     } else {
         // 兼容 CLI 模式：从命令行参数解析 JSON
         challengeObj = normalizeChallengeFromCli(options.challenge);
-        innertubeContextObj = normalizeInnertubeContextFromCli(options.innertubeContext);
+        innertubeContextObj = normalizeInnertubeContextFromCli(
+            options.innertubeContext,
+        );
     }
 
-    // 基础校验：contentBinding 必须存在
-    if (!contentBinding) {
-        console.error(
-            "Missing content binding. Pass -c/--content-binding or provide it in stdin JSON payload.",
-        );
-        console.log(JSON.stringify({}));
-        process.exit(1);
-    }
+    /**
+     * contentBinding 可以为空传给 SessionManager。
+     *
+     * 原因：
+     * - SessionManager 内部已经支持：
+     *   1. 从 innertubeContext.client.visitorData 补
+     *   2. 若仍没有，则通过 Innertube.create() 生成
+     *
+     * 因此这里不再强制要求 generate_once.ts 自己先校验 contentBinding 必须存在。
+     * 只要 SessionManager 最终也无法推导出 contentBinding，它会在内部报错。
+     */
 
     try {
         const sessionData = await sessionManager.generatePoToken(
@@ -259,24 +236,15 @@ const options = program.opts();
             innertubeContextObj,
         );
 
-        try {
-            fs.writeFileSync(
-                CACHE_PATH,
-                JSON.stringify(
-                    sessionManager.getYoutubeSessionDataCaches(true),
-                ),
-                "utf8",
-            );
-        } catch (e) {
-            console.warn(
-                `Error writing cache. err.name = ${e.name}. err.message = ${e.message}. err.stack = ${e.stack}`,
-            );
-        } finally {
-            console.log(JSON.stringify(sessionData));
-        }
-    } catch (e) {
+        /**
+         * 约定：
+         * - stdout 最后一行输出 JSON
+         * - Python provider 侧会把最后一行作为 JSON 响应解析
+         */
+        console.log(JSON.stringify(sessionData));
+    } catch (e: any) {
         console.error(
-            `Failed while generating POT. err.name = ${e.name}. err.message = ${e.message}. err.stack = ${e.stack}`,
+            `Failed while generating POT. err.name = ${e?.name}. err.message = ${e?.message}. err.stack = ${e?.stack}`,
         );
         console.log(JSON.stringify({}));
         process.exit(1);
