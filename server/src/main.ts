@@ -6,6 +6,7 @@ import express from "express";
 const program = new Command().option("-p, --port <PORT>").parse();
 
 const options = program.opts();
+
 const PORT_NUMBER = options.port || 4416;
 
 const httpServer = express();
@@ -73,6 +74,17 @@ httpServer
             },
         );
     });
+
+/**
+ * 直接访问根时，补充返回信息提示
+ */
+httpServer.get("/", async (request, response) => {
+    response
+        .status(400)
+        .send(
+            "This server is not meant to be accessed directly unless you know what you're doing. Follow the README for plugin/provider setup, and yt-dlp will automatically use the provider: https://github.com/Brainicism/bgutil-ytdlp-pot-provider#readme",
+        );
+});
 
 /**
  * 统一 POT 获取入口。

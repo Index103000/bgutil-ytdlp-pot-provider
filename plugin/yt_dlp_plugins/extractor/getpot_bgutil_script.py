@@ -105,14 +105,17 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
     def _jsrt_args(self) -> Iterable[str]:
         return ()
 
+    def _jsrt_envs(self) -> dict:
+        return os.environ.copy()
+
     def _jsrt_path_impl(self) -> str | None:
         jsrt_path = _determine_runtime_path(
             traverse_obj(self.ie.get_param('js_runtimes'), (self._JSRT_EXEC, 'path')),
             self._JSRT_EXEC)
         try:
             output, _, returncode = Popen.run(
-                [jsrt_path, '--version'], text=True, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5.0)
+                [jsrt_path, '--version'], env=self._jsrt_envs(), timeout=5.0,
+                text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             output = output.strip()
         except subprocess.TimeoutExpired:
             self.logger.debug(
@@ -196,7 +199,8 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             return False
         stdout, _, returncode = Popen.run(
             [self._jsrt_path, *self._jsrt_args(), script_path, '--version'],
-            stdout=subprocess.PIPE, text=True, timeout=self._GET_SCRIPT_VSN_TIMEOUT)
+            env=self._jsrt_envs(), timeout=self._GET_SCRIPT_VSN_TIMEOUT,
+            text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         stdout = stdout.strip()
         if returncode:
             self.logger.warning(
@@ -319,6 +323,7 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             # 所以这里手动创建进程，然后 communicate(input=...) 写入 stdin
             with Popen(
                     command_args,
+                    env=self._jsrt_envs(),
                     text=True,  # 让 stdin/stdout 走 str（内部会设置 encoding=utf-8, errors=replace）
                     stdin=subprocess.PIPE,  # 必须：让我们可以写入 stdin
                     stdout=subprocess.PIPE,  # 捕获 stdout
@@ -460,6 +465,13 @@ class BgUtilScriptDenoPTP(BgUtilScriptPTPBase):
             # - cache_dir：缓存读取
             f'--allow-read={escpath(server_home, server_home_real, node_mods_path, node_mods_path_real, script_cache_dir, script_cache_dir_real)}',
         )
+
+    def _jsrt_envs(self) -> dict:
+        process_env = os.environ.copy()
+        process_env['DENO_NO_PROMPT'] = '1'
+        process_env['DENO_NO_UPDATE_CHECK'] = '1'
+        process_env['FORCE_COLOR'] = 'false'
+        return process_env
 
 
 __all__ = [

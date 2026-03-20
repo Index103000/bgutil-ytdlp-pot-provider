@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = '1.3.0'
+__version__ = '1.3.1'
 
 import abc
 import json
@@ -60,7 +60,8 @@ class BgUtilPTPBase(PoTokenProvider, abc.ABC):
 
     @staticmethod
     def _resolve_script_path(*ps: str):
-        return os.path.abspath(
+        # realpath resolves symlinks and internally calls abspath
+        return os.path.realpath(
             os.path.expanduser(os.path.expandvars(os.path.join(*ps))))
 
     def _script_path_provided(self) -> str | None:
