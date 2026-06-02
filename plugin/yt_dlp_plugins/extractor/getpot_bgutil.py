@@ -44,7 +44,7 @@ class BgUtilPTPBase(PoTokenProvider, abc.ABC):
     # 当配置为 20秒 时，容易出现 Timeout expired when trying to run script，
     # 经测试，当前配置 120秒，基本不会出现 timeout。
     # 在 node 环境下，由于执行的是 build 后的文件，速度相对会快一些，20秒 可以正常执行。
-    _GETPOT_TIMEOUT = 300.0
+    _GETPOT_TIMEOUT = 20.0
 
     def _info_and_raise(self, msg, raise_from=None):
         self.logger.info(msg)
