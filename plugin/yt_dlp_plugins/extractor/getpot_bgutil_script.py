@@ -213,6 +213,55 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             self._check_version(stdout, name='script')
             return True
 
+    def _tail_text(self, text: str, max_chars: int = 6000) -> str:
+        """
+         截取文本尾部，避免日志过大。
+
+         为什么取尾部：
+         1. Node/Deno 脚本真正的异常栈通常在输出最后；
+         2. 高并发失败时，完整 stdout 可能很长，直接打全量会刷爆 systemd journal；
+         3. 只保留尾部既能定位问题，又能控制日志体积。
+        """
+        if not text:
+            return ""
+
+        if len(text) <= max_chars:
+            return text
+
+        return text[-max_chars:]
+
+    def _sanitize_log_text(self, text: str) -> str:
+        """
+        对脚本输出做日志脱敏。
+
+        主要处理代理 URL：
+        - http://user:pass@host:port
+        - https://user:pass@host:port
+        - socks5://user:pass@host:port
+        - socks5h://user:pass@host:port
+        """
+        if not text:
+            return ""
+
+        return re.sub(
+            r'((?:https?|socks5h?|socks4)://)([^/\s:@]+):([^@\s/]+)@',
+            r'\1***:***@',
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    def _tail_script_output_for_error(self, stdout: str, max_chars: int = 6000) -> str:
+        """
+        获取适合打印到错误日志中的脚本输出尾部。
+
+        处理顺序：
+        1. 截取尾部，控制日志长度；
+        2. 脱敏，避免代理账号密码进入日志。
+        """
+        return self._sanitize_log_text(
+            self._tail_text(stdout or "", max_chars=max_chars)
+        )
+
     def _real_request_pot(
         self,
         request: PoTokenRequest,
@@ -318,51 +367,97 @@ class BgUtilScriptPTPBase(BgUtilPTPBase, abc.ABC):
             # stdout, _, returncode = Popen.run(
             #     command_args, stdout=subprocess.PIPE, text=True,
             #     timeout=self._GETPOT_TIMEOUT)
-
-            # 不能用 Popen.run(input=...)：因为 yt-dlp 的 Popen.run 不会把 input 传给 communicate()，而我们需要 input 传递大内容 payload
-            # 所以这里手动创建进程，然后 communicate(input=...) 写入 stdin
+            #
+            # 不能用 Popen.run(input=...)：
+            # 因为 yt-dlp 的 Popen.run 不会把 input 传给 communicate()，
+            # 而我们这里需要通过 stdin 传递较大的 JSON payload。
+            #
+            # 所以这里手动创建进程，然后 communicate_or_kill(input=...) 写入 stdin。
             with Popen(
                     command_args,
                     env=self._jsrt_envs(),
-                    text=True,  # 让 stdin/stdout 走 str（内部会设置 encoding=utf-8, errors=replace）
-                    stdin=subprocess.PIPE,  # 必须：让我们可以写入 stdin
-                    stdout=subprocess.PIPE,  # 捕获 stdout
-                    stderr=subprocess.STDOUT,  # stderr 合并到 stdout，保持你原来的“最后一行 JSON”约定
+                    text=True,                 # stdin/stdout 使用 str，内部通常会处理 utf-8/errors=replace
+                    stdin=subprocess.PIPE,      # 必须：允许写入 stdin
+                    stdout=subprocess.PIPE,     # 捕获 stdout
+                    stderr=subprocess.STDOUT,   # stderr 合并到 stdout，便于拿到 Node/Deno 异常栈
             ) as proc:
                 # 关键：communicate_or_kill 支持把 input 写入 stdin（内部调用 subprocess.Popen.communicate）
-                stdout, _ = proc.communicate_or_kill(input=payload_str, timeout=self._GETPOT_TIMEOUT)
+                stdout, _ = proc.communicate_or_kill(
+                    input=payload_str,
+                    timeout=self._GETPOT_TIMEOUT,
+                )
                 returncode = proc.returncode
 
+            # stdout 兜底，避免后面 strip/splitlines 出现 None 问题
+            stdout = stdout or ""
             stdout_lines = stdout.strip().splitlines()
-            json_resp = stdout_lines.pop()
+            # 注意：
+            # 正常情况下，脚本最后一行应该是 JSON 响应；
+            # 但如果脚本异常退出，stdout_lines 可能为空，或者最后一行不是 JSON。
+            json_resp = stdout_lines.pop() if stdout_lines else ""
+
         except subprocess.TimeoutExpired as e:
             raise PoTokenProviderError(
-                f'_get_pot_via_script failed: Timeout expired when trying to run script (caused by {e!r})')
+                f'_get_pot_via_script failed: Timeout expired when trying to run script '
+                f'(caused by {e!r})'
+            ) from e
+
         except Exception as e:
             raise PoTokenProviderError(
-                f'_get_pot_via_script failed: Unable to run script (caused by {e!r})') from e
+                f'_get_pot_via_script failed: Unable to run script (caused by {e!r})'
+            ) from e
 
+        # 正常情况下，JSON 响应前面的输出都是脚本日志。
+        # 这里继续保留 trace 逐行输出，便于调试。
         if stdout_extra := stdout_lines:
             # self.logger.trace(f'script stdout:\n{stdout_extra}')
             # stdout_extra 是 list，直接 f-string 会变成 ['line1', 'line2'] 这种一行，不直观，改成更明确可见的输出（逐行输出）
             # 同时对每一行做一次字符串截断，避免脚本端也打印超长内容时刷屏。
             for line in stdout_extra:
+                # 每行也截断一下，避免单行日志过长。
+                if len(line) > 2000:
+                    line = line[-2000:]
                 self.logger.trace(f'script stdout: {line}')
+
+        # 关键：
+        # returncode != 0 时，把脚本输出尾部带出来。
+        #
+        # 注意：
+        # - stdout 已经包含 stderr，因为上面用了 stderr=subprocess.STDOUT；
+        # - json_resp 也可能包含错误输出的最后一行，所以这里直接用完整 stdout 的 tail；
+        # - 这样下一次 systemd 日志里就能看到 Deno/Node 的真实异常。
         if returncode:
+            output_tail = self._tail_script_output_for_error(stdout)
+            if output_tail:
+                self.logger.warning(
+                    f'_get_pot_via_script script failed output tail:\n{output_tail}'
+                )
             raise PoTokenProviderError(
-                f'_get_pot_via_script failed with returncode {returncode}')
+                f'_get_pot_via_script failed with returncode {returncode}; '
+                f'please check previous "_get_pot_via_script script failed output tail" log'
+            )
 
         try:
             self.logger.trace(f'JSON response:\n{json_resp}')
-            # The JSON response is always the last line
+            # 正常情况下，JSON response 一定是最后一行。
             script_data_resp = json.loads(json_resp)
+
         except json.JSONDecodeError as e:
+            output_tail = self._tail_script_output_for_error(stdout)
+            if output_tail:
+                self.logger.warning(
+                    f'_get_pot_via_script script failed output tail:\n{output_tail}'
+                )
             raise PoTokenProviderError(
-                f'Error parsing JSON response from _get_pot_via_script (caused by {e!r})') from e
+                f'Error parsing JSON response from _get_pot_via_script '
+                f'(caused by {e!r}); please check previous "_get_pot_via_script script failed output tail" log'
+            ) from e
 
         if 'poToken' not in script_data_resp:
             raise PoTokenProviderError(
-                'The script did not respond with a po_token')
+                f'The script did not respond with a po_token; '
+                f'json_resp={json_resp!r}'
+            )
 
         return PoTokenResponse(po_token=script_data_resp['poToken'])
 
