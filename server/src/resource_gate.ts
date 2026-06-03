@@ -72,17 +72,17 @@ const DEFAULT_RESERVATION_STALE_MS = 10 * 60 * 1000;
  * - 而是资源准入时使用的保守预算值
  * - 后续你可以根据实际压测结果继续调
  */
-export const DEFAULT_RESERVED_MB = 500;
+export const DEFAULT_RESERVED_MB = 0;
 
 /**
  * 启动/执行一个新高开销任务后，系统至少还应剩余多少可用内存（MB）。
  */
-export const DEFAULT_MIN_FREE_AFTER_LAUNCH_MB = 2000;
+export const DEFAULT_MIN_FREE_AFTER_LAUNCH_MB = 0;
 
 /**
  * 允许启动/执行新任务时的最大内存使用率（百分比）。
  */
-export const DEFAULT_MAX_MEMORY_PERCENT = 80.0;
+export const DEFAULT_MAX_MEMORY_PERCENT = 200.0;
 
 /**
  * 滑动窗口采样次数。
