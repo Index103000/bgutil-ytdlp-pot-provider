@@ -1,4 +1,4 @@
-import axios, { AxiosRequestConfig } from "axios";
+import axios, {AxiosRequestConfig} from "axios";
 import {
     BG,
     BgConfig,
@@ -9,11 +9,11 @@ import {
     getHeaders,
     USER_AGENT,
 } from "bgutils-js";
-import { Agent } from "node:https";
-import { ProxyAgent } from "proxy-agent";
-import { JSDOM } from "jsdom";
+import {Agent} from "node:https";
+import {ProxyAgent} from "proxy-agent";
+import {JSDOM} from "jsdom";
 import * as path from "node:path";
-import { Innertube, Context as InnertubeContext } from "youtubei.js";
+import {Innertube, Context as InnertubeContext} from "youtubei.js";
 
 import {
     buildYoutubeSessionData,
@@ -24,7 +24,8 @@ import {
     type YoutubeSessionData,
     type CacheEntryLock,
 } from "./cache_store.ts";
-import { ResourceGate } from "./resource_gate.ts";
+import {ResourceGate} from "./resource_gate.ts";
+import {BGUTIL_RUNTIME_CONFIG} from "./runtime_config.ts";
 
 /**
  * 进程内“按 contentBinding 索引”的 POT 缓存。
@@ -68,7 +69,8 @@ class Logger {
                 console.log(msg);
             };
         } else {
-            this.debug = this.log = () => {};
+            this.debug = this.log = () => {
+            };
         }
         this.warn = (msg: string) => {
             console.warn(msg);
@@ -101,7 +103,7 @@ class ProxySpec {
     public disableTlsVerification: boolean = false;
     public readonly ipFamily?: number;
 
-    constructor({ sourceAddress, disableTlsVerification }: Partial<ProxySpec>) {
+    constructor({sourceAddress, disableTlsVerification}: Partial<ProxySpec>) {
         this.sourceAddress = sourceAddress;
         this.disableTlsVerification = disableTlsVerification || false;
 
@@ -148,7 +150,7 @@ class ProxySpec {
         this: Readonly<this>,
         logger: Logger,
     ): Agent | undefined {
-        const { proxyUrl, sourceAddress, disableTlsVerification } = this;
+        const {proxyUrl, sourceAddress, disableTlsVerification} = this;
 
         if (!proxyUrl) {
             return new Agent({
@@ -160,7 +162,7 @@ class ProxySpec {
 
         // 只要 proxyUrl 存在，这里 proxy 一定是可用字符串
         const pxyStr = this.proxy!;
-        const { password } = proxyUrl;
+        const {password} = proxyUrl;
 
         const loggedProxy = password
             ? pxyStr.replace(password, "****")
@@ -200,7 +202,8 @@ class CacheSpec {
     constructor(
         public pxySpec: ProxySpec,
         public ip: string | null,
-    ) {}
+    ) {
+    }
 
     /**
      * 进程内 minterCache 的 key。
@@ -403,33 +406,86 @@ export class SessionManager {
      * 构造 bgutil 使用的统一资源门禁。
      *
      * 当前目录布局：
-     *   <cachedir>/resource_gate
+     * cachedir/resource_gate
      *
      * 说明：
-     * - 不把 resource_gate 放到外层入口维护
-     * - 而是直接下沉到 SessionManager
-     * - 这样 script / http 两条链路天然共用
+     * - ResourceGate 仍然由 SessionManager 统一管理；
+     * - script 模式与 http 模式都会走这里；
+     * - 具体阈值从 BGUTIL_RUNTIME_CONFIG 读取，便于线上通过环境变量调参；
+     * - 是否真正使用 ResourceGate，由 runWithResourceGate() 判断。
      */
     private buildBgutilResourceGate(): ResourceGate {
+        const cfg = BGUTIL_RUNTIME_CONFIG.resourceGate;
+
+        this.logger.log(
+            `[resource_gate] build config ` +
+            this.safeStringify({
+                disabled: BGUTIL_RUNTIME_CONFIG.disableResourceGate,
+                baseDir: path.resolve(this.cachedir, "resource_gate"),
+                reservedMb: cfg.reservedMb,
+                minFreeAfterLaunchMb: cfg.minFreeAfterLaunchMb,
+                maxMemoryPercent: cfg.maxMemoryPercent,
+                reservationStaleMs: cfg.reservationStaleMs,
+                sampleCount: cfg.sampleCount,
+                sampleIntervalMs: cfg.sampleIntervalMs,
+                retryIntervalMs: cfg.retryIntervalMs,
+            }),
+        );
+
         return new ResourceGate({
             gateName: "bgutil_generate_pot",
             baseDir: path.resolve(this.cachedir, "resource_gate"),
 
             /**
-             * 以下参数当前先给一个偏保守默认值：
-             * - reservedMb=500
-             * - minFreeAfterLaunchMb=2000
-             * - maxMemoryPercent=80
+             * 单个 POT 生成任务预估会占用的内存。
              *
-             * 后续你可以按压测结果继续调整。
+             * 说明：
+             * - 原来写死 500；
+             * - 现在允许通过 BGUTIL_RESOURCE_GATE_RESERVED_MB 调整。
              */
-            reservedMb: 500,
-            minFreeAfterLaunchMb: 2000,
-            maxMemoryPercent: 80.0,
-            reservationStaleMs: 10 * 60 * 1000,
-            sampleCount: 5,
-            sampleIntervalMs: 500,
-            retryIntervalMs: 2000,
+            reservedMb: cfg.reservedMb,
+
+            /**
+             * 允许启动新任务后，系统仍需保留的最小空闲内存。
+             *
+             * 说明：
+             * - 原来写死 2000；
+             * - 现在允许通过 BGUTIL_RESOURCE_GATE_MIN_FREE_AFTER_LAUNCH_MB 调整。
+             */
+            minFreeAfterLaunchMb: cfg.minFreeAfterLaunchMb,
+
+            /**
+             * 最大内存占用百分比。
+             *
+             * 说明：
+             * - 原来写死 80；
+             * - 现在允许通过 BGUTIL_RESOURCE_GATE_MAX_MEMORY_PERCENT 调整。
+             */
+            maxMemoryPercent: cfg.maxMemoryPercent,
+
+            /**
+             * reservation 文件的 stale 时间。
+             *
+             * 说明：
+             * - 原来写死 10 分钟；
+             * - 如果进程异常退出，超过该时间后 reservation 可被视为陈旧。
+             */
+            reservationStaleMs: cfg.reservationStaleMs,
+
+            /**
+             * 资源采样次数。
+             */
+            sampleCount: cfg.sampleCount,
+
+            /**
+             * 每次采样间隔。
+             */
+            sampleIntervalMs: cfg.sampleIntervalMs,
+
+            /**
+             * 资源不足时重试间隔。
+             */
+            retryIntervalMs: cfg.retryIntervalMs,
         });
     }
 
@@ -437,10 +493,26 @@ export class SessionManager {
      * 用资源门禁包裹真正的高开销生成动作。
      *
      * 设计目标：
-     * - 让 generatePoToken 的主流程更清晰
-     * - 避免把资源门禁的细节散落在 generatePoToken 里
+     * - 缓存命中时不走 ResourceGate；
+     * - 只有真正要 mint POT 时，才进入资源门禁；
+     * - 允许通过 BGUTIL_DISABLE_RESOURCE_GATE=1 跳过资源门禁；
+     * - 跳过后不会等待 reservation / 内存阈值 / 资源采样。
+     *
+     * 为什么需要可禁用：
+     * - script-node 模式下，每个 yt-dlp 调用都会拉起一个 Node 进程；
+     * - 高并发冷启动时，ResourceGate 可能让多个 Node 子进程一直等待；
+     * - Python plugin 外层 300 秒超时会直接 kill Node；
+     * - 因此在你当前下载系统里，需要允许“尽量使用资源”，而不是内部排队。
      */
     private async runWithResourceGate<T>(fn: () => Promise<T>): Promise<T> {
+        if (BGUTIL_RUNTIME_CONFIG.disableResourceGate) {
+            this.logger.warn(
+                `[resource_gate] disabled by BGUTIL_DISABLE_RESOURCE_GATE, run directly`,
+            );
+
+            return await fn();
+        }
+
         return await this.resourceGate.runExclusiveWithPermission(
             {
                 debug: (msg) => this.logger.debug(msg),
@@ -554,8 +626,8 @@ export class SessionManager {
                 this.logger.debug("Using challenge from the webpage");
             }
 
-            const { program, globalName, interpreterHash } = challenge;
-            const { privateDoNotAccessOrElseTrustedResourceUrlWrappedValue } =
+            const {program, globalName, interpreterHash} = challenge;
+            const {privateDoNotAccessOrElseTrustedResourceUrlWrappedValue} =
                 challenge.interpreterUrl;
 
             const interpreterJSResponse = await bgConfig.fetch(
@@ -569,12 +641,12 @@ export class SessionManager {
                 interpreterHash,
                 interpreterJavascript: {
                     privateDoNotAccessOrElseSafeScriptWrappedValue:
-                        interpreterJS,
+                    interpreterJS,
                     privateDoNotAccessOrElseTrustedResourceUrlWrappedValue,
                 },
             };
         } catch (e) {
-            throw new Error("Could not get BotGuard challenge", { cause: e });
+            throw new Error("Could not get BotGuard challenge", {cause: e});
         }
     }
 
@@ -597,7 +669,7 @@ export class SessionManager {
             innertubeContext,
         );
 
-        const { program, globalName } = descrambledChallenge;
+        const {program, globalName} = descrambledChallenge;
         const interpreterJavascript =
             descrambledChallenge.interpreterJavascript
                 .privateDoNotAccessOrElseSafeScriptWrappedValue;
@@ -616,7 +688,7 @@ export class SessionManager {
                 globalObj: bgConfig.globalObj,
             });
         } catch (e) {
-            throw new Error("Failed to create BG client.", { cause: e });
+            throw new Error("Failed to create BG client.", {cause: e});
         }
 
         try {
@@ -727,7 +799,7 @@ export class SessionManager {
         } catch (e: any) {
             throw new Error(
                 `Failed to mint POT for ${contentBinding}: ${e?.message}`,
-                { cause: e },
+                {cause: e},
             );
         }
     }
@@ -770,7 +842,7 @@ export class SessionManager {
 
         // Deno 的 proxy 直接用 string（http://user:pass@host:port）
         return DenoNS.createHttpClient({
-            proxy: proxySpec.proxy ? { url: proxySpec.proxy } : undefined,
+            proxy: proxySpec.proxy ? {url: proxySpec.proxy} : undefined,
             // 语义对齐：disableTlsVerification=true => 不校验证书
             // Deno 里是 `caCerts` / `cert` / `key` 之类更细项；最简单做法：
             // 如果你需要“跳过证书校验”，建议在代理侧保证证书正确，或者只用于 https proxy。
@@ -866,66 +938,228 @@ export class SessionManager {
     }
 
     /**
+     * 判断当前请求是否应该启用主动超时。
+     *
+     * 规则：
+     * - BGUTIL_FETCH_TIMEOUT_MS <= 0：不启用；
+     * - BGUTIL_FETCH_TIMEOUT_ONLY_WHEN_PROXY=false：所有请求都启用；
+     * - BGUTIL_FETCH_TIMEOUT_ONLY_WHEN_PROXY=true：只有存在代理时才启用。
+     */
+    private shouldApplyFetchTimeout(proxySpec: ProxySpec): boolean {
+        if (BGUTIL_RUNTIME_CONFIG.fetchTimeoutMs <= 0) {
+            return false;
+        }
+
+        if (!BGUTIL_RUNTIME_CONFIG.fetchTimeoutOnlyWhenProxy) {
+            return true;
+        }
+
+        return !!proxySpec.proxy;
+    }
+
+    /**
+     * 构造 AbortController，并在 timeoutMs 后主动 abort。
+     *
+     * 说明：
+     * - 主要用于 Deno fetch；
+     * - Node axios 使用自身的 timeout 参数即可；
+     * - 这里返回 controller 和 cleanup，调用方必须在 finally 中 cleanup，
+     *   避免 setTimeout 泄漏。
+     */
+    private buildAbortControllerForTimeout(
+        timeoutMs: number,
+    ): {
+        controller: AbortController;
+        cleanup: () => void;
+    } {
+        const controller = new AbortController();
+
+        const timer = setTimeout(() => {
+            controller.abort();
+        }, timeoutMs);
+
+        return {
+            controller,
+            cleanup: () => clearTimeout(timer),
+        };
+    }
+
+    /**
+     * 将异常转成尽量可读的日志字符串。
+     *
+     * 说明：
+     * - axios error / DOMException / 普通 Error 的字段不完全一致；
+     * - 这里统一做一层兜底，便于日志定位。
+     */
+    private errorToLogString(e: unknown): string {
+        if (e instanceof Error) {
+            const anyError = e as any;
+
+            return this.safeStringify({
+                name: e.name,
+                message: e.message,
+                code: anyError.code,
+                status: anyError.response?.status,
+                statusText: anyError.response?.statusText,
+            });
+        }
+
+        return this.safeStringify(e);
+    }
+
+    /**
      * 构造统一 fetch。
      *
      * 说明：
-     * - Deno 路径：原生 fetch + createHttpClient
-     * - Node 路径：axios + httpsAgent / ProxyAgent
-     * - 带重试机制
+     * - Deno 路径：原生 fetch + createHttpClient；
+     * - Node 路径：axios + httpsAgent / ProxyAgent；
+     * - 带重试机制；
+     * - 支持请求级超时，避免代理 / YouTube 请求无限等待。
+     *
+     * 重要说明：
+     * - 这里的 timeout 是“单次请求 timeout”，不是整个 POT 生成流程 timeout；
+     * - 外层 Python plugin 仍然有 300 秒总超时；
+     * - 单次请求 timeout 建议明显小于 300 秒，例如 30 秒；
+     * - 如果一次请求 timeout，会进入 retry；
+     * - 全部 retry 失败后抛异常，由 generatePoToken 外层处理。
      */
     private getFetch(
         proxySpec: ProxySpec,
         maxRetries: number,
         intervalMs: number,
     ): FetchFunction {
-        const { logger } = this;
+        const {logger} = this;
 
-        return async (url: any, options: any): Promise<any> => {
+        return async (url: any, options: any): Promise<Response> => {
             const method = (options?.method || "GET").toUpperCase();
 
-            for (let attempts = 1; attempts <= maxRetries; attempts++) {
-                try {
-                    // ====== Deno 路径：createHttpClient + 原生 fetch ======
-                    if (this._isDenoRuntime()) {
-                        const client = this._getDenoHttpClient(
-                            proxySpec,
-                            logger,
-                        );
-                        const finalUrl = this.applyParamsToUrl(
-                            url,
-                            options?.params,
-                        );
+            const timeoutEnabled = this.shouldApplyFetchTimeout(proxySpec);
+            const timeoutMs = BGUTIL_RUNTIME_CONFIG.fetchTimeoutMs;
 
-                        // 由于 deno 的 fetch 请求，针对 header 中 重复且大小写不同的 Content-Type 参数，无法正常覆盖，导致最终请求失败
-                        // 从代码层面分析：
-                        // 外层调用时，对应 getHeaders() 里本来就带了 "content-type":"application/json+protobuf"，然后又配置 "Content-Type": "application/json"
-                        // 涉及到的代码如下：
-                        // headers: {
-                        //     ...getHeaders(),
-                        //     "Content-Type": "application/json",
-                        // },
-                        // 不同请求方案对应 header 的处理不同
-                        // • Node(axios) 合并 header 时更倾向“后者覆盖前者/大小写归一”，最终只有一个 content-type
-                        // • Deno(fetch) 直接传了普通对象，可能会把 content-type 和 Content-Type 当成两条 header 发出去，服务端挑了 protobuf 那个，于是报 “不接受 top-level braces”。
-                        // 这里通过 normalizeHeaders 方法，将 header 中的参数进行 小写 + 去重
+            for (let attempts = 1; attempts <= maxRetries; attempts++) {
+                const requestStartedAt = Date.now();
+
+                try {
+                    logger.debug(
+                        `[fetch] begin ` +
+                        this.safeStringify({
+                            method,
+                            url: String(url),
+                            attempt: attempts,
+                            maxRetries,
+                            timeoutEnabled,
+                            timeoutMs: timeoutEnabled ? timeoutMs : 0,
+                            hasProxy: !!proxySpec.proxy,
+                        }),
+                    );
+
+                    /**
+                     * ====== Deno 路径：createHttpClient + 原生 fetch ======
+                     *
+                     * 注意：
+                     * - Deno fetch 自身不使用 axios；
+                     * - 因此需要通过 AbortController 实现请求超时；
+                     * - 超时时会抛 AbortError；
+                     * - catch 后会走统一重试逻辑。
+                     */
+                    if (this._isDenoRuntime()) {
+                        const client = this._getDenoHttpClient(proxySpec, logger);
+                        const finalUrl = this.applyParamsToUrl(url, options?.params);
+
+                        /**
+                         * 由于 Deno 的 fetch 请求，针对 header 中重复且大小写不同的
+                         * Content-Type 参数，无法正常覆盖，可能导致服务端解析失败。
+                         *
+                         * 这里通过 normalizeHeaders 做小写 + 去重：
+                         * - content-type
+                         * - Content-Type
+                         *
+                         * 最终只保留一个语义 header。
+                         */
                         const headers = this.normalizeHeaders(options?.headers);
 
-                        const resp = await fetch(finalUrl, {
-                            method,
-                            headers,
-                            body: options?.body,
-                            // Deno 扩展：把 client 传给 fetch
-                            client,
-                        } as any);
+                        const timeoutCtx = timeoutEnabled
+                            ? this.buildAbortControllerForTimeout(timeoutMs)
+                            : undefined;
 
-                        return resp; // 已经是标准 Response
+                        try {
+                            const resp = await fetch(finalUrl, {
+                                method,
+                                headers,
+                                body: options?.body,
+
+                                /**
+                                 * Deno 扩展字段。
+                                 *
+                                 * 说明：
+                                 * - 在 Deno 环境下有效；
+                                 * - Node 类型系统不认识，所以这里保持 as any。
+                                 */
+                                client,
+
+                                /**
+                                 * 标准 AbortController signal。
+                                 *
+                                 * 说明：
+                                 * - timeoutEnabled=false 时不传；
+                                 * - timeoutEnabled=true 时，超过 timeoutMs 会触发 abort。
+                                 */
+                                signal: timeoutCtx?.controller.signal,
+                            } as any);
+
+                            logger.debug(
+                                `[fetch] done ` +
+                                this.safeStringify({
+                                    method,
+                                    url: String(finalUrl),
+                                    attempt: attempts,
+                                    status: resp.status,
+                                    costMs: Date.now() - requestStartedAt,
+                                }),
+                            );
+
+                            return resp;
+                        } finally {
+                            timeoutCtx?.cleanup();
+                        }
                     }
 
-                    // ====== Node 路径：axios + httpsAgent，然后包装成 Response ======
+                    /**
+                     * ====== Node 路径：axios + httpsAgent / ProxyAgent ======
+                     *
+                     * 重点修改：
+                     * - 原来 axiosOpt 没有 timeout；
+                     * - 代理/TLS/Google 请求如果半开，可能一直不返回；
+                     * - 现在通过 timeout 避免单个请求无限等待。
+                     */
                     const axiosOpt: AxiosRequestConfig = {
                         headers: options?.headers,
                         params: options?.params,
+
+                        /**
+                         * 代理 / 本地源地址 / TLS 校验由 ProxySpec 统一处理。
+                         */
                         httpsAgent: proxySpec.asDispatcher(logger),
+
+                        /**
+                         * 单次请求 timeout。
+                         *
+                         * 注意：
+                         * - axios timeout 单位是毫秒；
+                         * - 0 表示不设置 timeout；
+                         * - 这里 timeoutEnabled=false 时传 undefined，保持 axios 默认行为。
+                         */
+                        timeout: timeoutEnabled ? timeoutMs : undefined,
+
+                        /**
+                         * 避免 axios 因 4xx/5xx 自动 throw 后丢失 response body。
+                         *
+                         * 说明：
+                         * - bgutils-js 的 fetch 语义更接近标准 fetch；
+                         * - 标准 fetch 对 4xx/5xx 不会 throw；
+                         * - 这里返回 response，由上层根据 body/status 判断。
+                         */
+                        validateStatus: () => true,
                     };
 
                     const response =
@@ -933,6 +1167,24 @@ export class SessionManager {
                             ? await axios.get(url, axiosOpt)
                             : await axios.post(url, options?.body, axiosOpt);
 
+                    logger.debug(
+                        `[fetch] done ` +
+                        this.safeStringify({
+                            method,
+                            url: String(url),
+                            attempt: attempts,
+                            status: response.status,
+                            costMs: Date.now() - requestStartedAt,
+                        }),
+                    );
+
+                    /**
+                     * 将 axios response 包装成近似标准 Response 的对象。
+                     *
+                     * 说明：
+                     * - bgutils-js 这里只需要 json()/text()/status/ok 这一类能力；
+                     * - 保持和原有代码兼容。
+                     */
                     return {
                         ok: response.status >= 200 && response.status < 300,
                         status: response.status,
@@ -941,17 +1193,33 @@ export class SessionManager {
                             typeof response.data === "string"
                                 ? response.data
                                 : JSON.stringify(response.data),
-                    };
+                    } as Response;
                 } catch (e) {
+                    const costMs = Date.now() - requestStartedAt;
+
+                    logger.warn(
+                        `[fetch] failed ` +
+                        this.safeStringify({
+                            method,
+                            url: String(url),
+                            attempt: attempts,
+                            maxRetries,
+                            costMs,
+                            timeoutEnabled,
+                            timeoutMs: timeoutEnabled ? timeoutMs : 0,
+                            hasProxy: !!proxySpec.proxy,
+                            error: this.errorToLogString(e),
+                        }),
+                    );
+
                     if (attempts >= maxRetries) {
                         throw new Error(
                             `Error reaching ${method} ${url}: All ${attempts} retries failed.`,
-                            { cause: e },
+                            {cause: e},
                         );
                     }
-                    await new Promise((resolve) =>
-                        setTimeout(resolve, intervalMs),
-                    );
+
+                    await new Promise((resolve) => setTimeout(resolve, intervalMs));
                 }
             }
 
@@ -987,8 +1255,8 @@ export class SessionManager {
      * - innertubeContext
      */
     private summarizeForLog(v: any, limit = 500) {
-        if (v === undefined) return { type: "undefined" };
-        if (v === null) return { type: "null" };
+        if (v === undefined) return {type: "undefined"};
+        if (v === null) return {type: "null"};
 
         const t = typeof v;
         if (t === "string") {
@@ -1059,16 +1327,16 @@ export class SessionManager {
 
         this.logger.log(
             `[${traceId}] generatePoToken:enter ` +
-                this.safeStringify({
-                    content_binding: contentBinding ?? "",
-                    proxy_arg: proxy ?? "",
-                    proxy_env_candidate: envProxy,
-                    bypass_cache: !!bypassCache,
-                    source_address: sourceAddress ?? "",
-                    disable_tls_verification: !!disableTlsVerification,
-                    challenge: this.summarizeForLog(challenge),
-                    innertube_context: this.summarizeForLog(innertubeContext),
-                }),
+            this.safeStringify({
+                content_binding: contentBinding ?? "",
+                proxy_arg: proxy ?? "",
+                proxy_env_candidate: envProxy,
+                bypass_cache: !!bypassCache,
+                source_address: sourceAddress ?? "",
+                disable_tls_verification: !!disableTlsVerification,
+                challenge: this.summarizeForLog(challenge),
+                innertube_context: this.summarizeForLog(innertubeContext),
+            }),
         );
 
         /**
@@ -1096,7 +1364,7 @@ export class SessionManager {
             pxySpec.proxy = proxy;
             this.logger.log(
                 `[${traceId}] generatePoToken:proxy_selected from_arg ` +
-                    this.safeStringify({ proxy_selected: pxySpec.proxy }),
+                this.safeStringify({proxy_selected: pxySpec.proxy}),
             );
         } else {
             pxySpec.proxy =
@@ -1106,9 +1374,9 @@ export class SessionManager {
 
             this.logger.log(
                 `[${traceId}] generatePoToken:proxy_selected from_env ` +
-                    this.safeStringify({
-                        proxy_selected: pxySpec.proxy ?? "",
-                    }),
+                this.safeStringify({
+                    proxy_selected: pxySpec.proxy ?? "",
+                }),
             );
         }
 
@@ -1179,11 +1447,11 @@ export class SessionManager {
 
         this.logger.log(
             `[${traceId}] generatePoToken:cacheSpec ` +
-                this.safeStringify({
-                    remoteHost: innertubeContext?.client.remoteHost || null,
-                    cacheKey: cacheSpec.key,
-                    cachedir: this.cachedir,
-                }),
+            this.safeStringify({
+                remoteHost: innertubeContext?.client.remoteHost || null,
+                cacheKey: cacheSpec.key,
+                cachedir: this.cachedir,
+            }),
         );
 
         const bgConfig: BgConfig = {
@@ -1195,10 +1463,10 @@ export class SessionManager {
 
         this.logger.log(
             `[${traceId}] generatePoToken:bgConfig_ready ` +
-                this.safeStringify({
-                    identifier: bgConfig.identifier,
-                    requestKey: bgConfig.requestKey,
-                }),
+            this.safeStringify({
+                identifier: bgConfig.identifier,
+                requestKey: bgConfig.requestKey,
+            }),
         );
 
         /**
@@ -1206,31 +1474,26 @@ export class SessionManager {
          * 单 key 锁：以 resolvedContentBinding 为粒度
          * =========================
          *
-         * 设计目标：
-         * - 相同 contentBinding 串行，避免并发重复 mint
-         * - 不同 contentBinding 并发，不互相阻塞
+         * 原始设计目标：
+         * - 相同 contentBinding 串行，避免并发重复 mint；
+         * - 不同 contentBinding 并发，不互相阻塞；
+         * - 后来的请求能读取前一个请求刚写入的磁盘缓存。
          *
-         * 这样可以避免同一个 key 在多进程/多并发下重复 mint。
+         * 新增配置：
+         * - BGUTIL_DISABLE_CACHE_LOCK=1 时，跳过该目录锁；
+         * - 跳过锁后可以避免 stale lock / 等锁导致 generate_once.js 卡住；
+         * - 代价是相同 contentBinding 可能被多个进程重复生成。
          */
-        const contentBindingLock: CacheEntryLock = getCacheEntryLock(
-            this.cachedir,
-            resolvedContentBinding,
-        );
-
-        return await contentBindingLock.runExclusive(async () => {
+        const generateWithinOptionalLock = async (): Promise<YoutubeSessionData> => {
             /**
              * ================================================================
              * Step 1. 先查单 key 磁盘缓存（跨进程共享）
              * ================================================================
              *
-             * 优先级最高。
-             * 原因：
-             * - 磁盘缓存可以跨进程共享
-             * - 多个 script / 多个 HTTP 请求 / 多个子进程都能复用
-             *
-             * 这里必须放在单 key 锁里读，才能确保：
-             * - 同 key 并发请求不会重复 mint
-             * - 后来的请求能读到前一个请求刚写回的结果
+             * 注意：
+             * - 即使禁用目录锁，也仍然可以查磁盘缓存；
+             * - 禁用目录锁只是不再串行化；
+             * - 读取缓存本身是轻量动作，仍有价值。
              */
             if (!bypassCache) {
                 const diskCached = getYoutubeSessionDataLocked(
@@ -1245,21 +1508,14 @@ export class SessionManager {
                     );
 
                     /**
-                     * 命中磁盘缓存后，顺手把结果同步回当前进程内缓存。
-                     *
-                     * 好处：
-                     * - 当前进程后续再访问同一个 contentBinding 时，
-                     *   即使磁盘缓存层 miss / 未查到，也还能继续享受进程内缓存命中。
+                     * 命中磁盘缓存后，同步写入当前进程内缓存。
                      */
-                    this.youtubeSessionDataCaches[resolvedContentBinding] =
-                        diskCached;
+                    this.youtubeSessionDataCaches[resolvedContentBinding] = diskCached;
 
                     return diskCached;
-                } else {
-                    this.logger.log(
-                        `[${traceId}] generatePoToken:miss_disk_cache`,
-                    );
                 }
+
+                this.logger.log(`[${traceId}] generatePoToken:miss_disk_cache`);
             } else {
                 this.logger.log(
                     `[${traceId}] generatePoToken:bypassCache=true -> skip_disk_cache`,
@@ -1270,25 +1526,19 @@ export class SessionManager {
              * ================================================================
              * Step 2. 再查当前进程内 sessionData 缓存
              * ================================================================
-             *
-             * 磁盘缓存 miss 后，再看当前进程内缓存：
-             * 1. youtubeSessionDataCaches
-             * 2. _minterCache
              */
             if (!bypassCache) {
-                const memoryCached =
-                    this.youtubeSessionDataCaches[resolvedContentBinding];
+                const memoryCached = this.youtubeSessionDataCaches[resolvedContentBinding];
 
                 if (memoryCached && new Date() <= memoryCached.expiresAt) {
                     this.logger.log(
                         `[${traceId}] generatePoToken:hit_memory_session_cache -> return_cached_token`,
                     );
+
                     return memoryCached;
-                } else {
-                    this.logger.log(
-                        `[${traceId}] generatePoToken:miss_memory_session_cache`,
-                    );
                 }
+
+                this.logger.log(`[${traceId}] generatePoToken:miss_memory_session_cache`);
             }
 
             /**
@@ -1296,50 +1546,41 @@ export class SessionManager {
              * Step 3. 进入真正高开销生成路径前，统一走资源门禁
              * ================================================================
              *
-             * 说明：
-             * - 只有在缓存 miss 时，才需要资源门禁
-             * - 这样缓存命中不会被无意义排队
+             * 注意：
+             * - ResourceGate 自身也可通过 BGUTIL_DISABLE_RESOURCE_GATE=1 跳过；
+             * - 只有缓存 miss 时才会走到这里。
              */
             return await this.runWithResourceGate(async () => {
                 /**
                  * ============================================================
-                 * Step 4. 再看当前进程内 minterCache
+                 * Step 4. 检查当前进程内 minterCache
                  * ============================================================
                  *
-                 * 这里放在资源门禁内，而不是外面，原因是：
-                 * - 即使 minterCache 命中，后续 tryMintPOT 仍属于高开销步骤
-                 * - 因此把“minter 判定 + refresh + mint”整体放进同一段门禁更直观
+                 * 说明：
+                 * - minterCache 是按网络环境区分；
+                 * - 不是按 contentBinding 区分；
+                 * - 如果 minter 未过期，可以直接 mint 当前 contentBinding。
                  */
-                let tokenMinter = this._minterCache.get(cacheSpec.key);
+                const cachedMinter = this._minterCache.get(cacheSpec.key);
 
-                if (tokenMinter) {
+                let tokenMinter: TokenMinter;
+
+                if (cachedMinter && new Date() <= cachedMinter.expiry) {
                     this.logger.log(
-                        `[${traceId}] generatePoToken:hit_minterCache ` +
-                            this.safeStringify({
-                                minter_expiry: String(tokenMinter.expiry),
-                            }),
+                        `[${traceId}] generatePoToken:hit_minter_cache -> mint_pot`,
                     );
 
-                    if (new Date() >= tokenMinter.expiry) {
+                    tokenMinter = cachedMinter;
+                } else {
+                    if (cachedMinter) {
                         this.logger.log(
-                            `[${traceId}] generatePoToken:minter_expired -> regenerate_tokenMinter`,
-                        );
-
-                        tokenMinter = await this.generateTokenMinter(
-                            cacheSpec,
-                            bgConfig,
-                            challenge,
-                            innertubeContext,
+                            `[${traceId}] generatePoToken:expired_minter_cache -> regenerate_minter`,
                         );
                     } else {
                         this.logger.log(
-                            `[${traceId}] generatePoToken:minter_fresh -> reuse_tokenMinter`,
+                            `[${traceId}] generatePoToken:miss_minter_cache -> generate_minter`,
                         );
                     }
-                } else {
-                    this.logger.log(
-                        `[${traceId}] generatePoToken:miss_minterCache -> generate_tokenMinter`,
-                    );
 
                     tokenMinter = await this.generateTokenMinter(
                         cacheSpec,
@@ -1351,35 +1592,75 @@ export class SessionManager {
 
                 /**
                  * ============================================================
-                 * Step 5. 真正 mint POT
+                 * Step 5. 使用 minter mint 最终 POT
                  * ============================================================
                  */
-                this.logger.log(`[${traceId}] generatePoToken:tryMintPOT`);
-
-                const result = await this.tryMintPOT(
+                const generatedSessionData = await this.tryMintPOT(
                     resolvedContentBinding,
                     tokenMinter,
                 );
 
                 /**
                  * ============================================================
-                 * Step 6. 在同一把单 key 锁内写回磁盘缓存
+                 * Step 6. 写回磁盘缓存
                  * ============================================================
                  *
-                 * 这样可以避免多个同 key 并发时互相覆盖。
+                 * 注意：
+                 * - 即使禁用了目录锁，也仍然写磁盘缓存；
+                 * - 多进程同时写相同 key 的概率存在，但 saveYoutubeSessionDataUnlocked()
+                 *   内部使用 “临时文件 + rename” 原子替换；
+                 * - generatedSessionData 自身已经包含 contentBinding 字段，
+                 *   因此 setYoutubeSessionDataLocked() 不需要额外传 resolvedContentBinding。
                  */
-                setYoutubeSessionDataLocked(this.cachedir, result);
+                if (!bypassCache) {
+                    setYoutubeSessionDataLocked(
+                        this.cachedir,
+                        generatedSessionData,
+                    );
 
-                this.logger.log(
-                    `[${traceId}] generatePoToken:done ` +
-                        this.safeStringify({
-                            poToken: result.poToken,
-                            expiresAt: String(result.expiresAt),
-                        }),
-                );
+                    this.logger.log(
+                        `[${traceId}] generatePoToken:write_disk_cache_done`,
+                    );
+                } else {
+                    this.logger.log(
+                        `[${traceId}] generatePoToken:bypassCache=true -> skip_write_disk_cache`,
+                    );
+                }
 
-                return result;
+                return generatedSessionData;
             });
+        };
+
+        if (BGUTIL_RUNTIME_CONFIG.disableCacheLock) {
+            this.logger.warn(
+                `[${traceId}] cache_lock disabled by BGUTIL_DISABLE_CACHE_LOCK, run without contentBinding lock`,
+            );
+
+            return await generateWithinOptionalLock();
+        }
+
+        this.logger.log(
+            `[${traceId}] cache_lock waiting ` +
+            this.safeStringify({
+                contentBinding: resolvedContentBinding,
+                cachedir: this.cachedir,
+            }),
+        );
+
+        const contentBindingLock: CacheEntryLock = getCacheEntryLock(
+            this.cachedir,
+            resolvedContentBinding,
+        );
+
+        return await contentBindingLock.runExclusive(async () => {
+            this.logger.log(
+                `[${traceId}] cache_lock acquired ` +
+                this.safeStringify({
+                    contentBinding: resolvedContentBinding,
+                }),
+            );
+
+            return await generateWithinOptionalLock();
         });
     }
 }

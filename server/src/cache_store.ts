@@ -188,7 +188,7 @@ export class CacheEntryLock {
     ) {
         this.lockPath = lockPath;
         this.retryIntervalMs = options?.retryIntervalMs ?? 50;
-        this.staleMs = options?.staleMs ?? 5 * 60 * 1000;
+        this.staleMs = options?.staleMs ?? 30 * 1000;
     }
 
     /**
